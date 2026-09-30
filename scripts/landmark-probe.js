@@ -11,11 +11,13 @@
 //   - the operator signs in directly in that browser; credentials and
 //     verification codes never pass through this process
 //   - after sign-in, every non-GET/HEAD request to the retailer origin is
-//     aborted, non-rendering cross-origin requests are aborted, and
-//     checkout/logout navigation is blocked
+//     aborted, non-rendering cross-origin requests are aborted, checkout/logout
+//     navigation is blocked, and redirects are never followed
 //   - only /api/ JSON bodies and query parameters are recorded, and both are
 //     redacted before anything is written; request header and cookie values
 //     are never read or stored (names only)
+//   - published values come from a small allowlist; every other field keeps its
+//     name and shape but not its value, so an unknown field cannot leak
 //   - no retries, no mutations, no order/payment actions
 //
 // Usage: see docs/integrations/landmark/signed-in-read-probe-procedure.md
@@ -35,6 +37,9 @@ const DEFAULT_OUT_DIR = '.local/landmark-probe/evidence';
 const MAX_ARRAY = 50;
 const MAX_DEPTH = 8;
 const MAX_STRING = 500;
+const MAX_PATH_SEGMENT = 48;
+
+const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 
 // Fields that identify a person. Collapsed entirely; never digests, because a
 // digest of an email or phone number is still a linkable identifier.
@@ -44,6 +49,46 @@ const PERSONAL_KEY = /(email|e_mail|phone|mobile|address|postcode|postal|zip|fir
 // the operator can confirm the same account/cart across runs without the value
 // being published.
 const OPAQUE_KEY = /(nonce|token|secret|password|passwd|auth|session|cookie|csrf|api[-_]?key|^key$|_key$|customer|account_?id|user_?id|user_?name|login)/i;
+
+// The only field names whose values are ever published. Everything else is
+// omitted: an unrecognised field fails closed rather than leaking. Product and
+// account names are deliberately absent, because a `name` field cannot be told
+// apart from a person's name. Identify products by id/sku instead.
+const SAFE_SCALAR_KEYS = new Set([
+  'id',
+  'ids',
+  'productId',
+  'product_id',
+  'parentId',
+  'parent_id',
+  'variantId',
+  'variantIds',
+  'relatedIds',
+  'type',
+  'sku',
+  'slug',
+  'handle',
+  'quantity',
+  'count',
+  'itemsCount',
+  'total',
+  'subtotal',
+  'price',
+  'amount',
+  'currency_code',
+  'currencyCode',
+  'currency_minor_unit',
+  'isOpenWeight',
+  'is_open_weight',
+  'availableForSale',
+  'status',
+  'code',
+  'page',
+  'limit',
+  'categoryId',
+  'substoreId',
+  'substoreAlias',
+]);
 
 // Query parameters that describe shopping context rather than the operator.
 // These are the evidence ticket 02 needs, and they were already public in the
@@ -65,26 +110,39 @@ const RENDER_TYPES = new Set(['script', 'stylesheet', 'image', 'font', 'media'])
 
 const BLOCKED_NAV = /^\/(checkout|logout|my-account\/orders)/i;
 
-export function digest(value) {
+function digest(value) {
   return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 12);
 }
 
 /** Values that are plainly opaque regardless of their field name. */
-export function looksOpaque(value) {
+function looksOpaque(value) {
   return /^[0-9a-f]{32,}$/i.test(value) || /^eyJ[\w-]+\.[\w-]+\./.test(value);
 }
 
 /** The only shape an opaque identifier or secret is ever published in. */
-export function opaque(value) {
-  return { redacted: true, digest: digest(value), length: String(value).length };
+function opaque(value) {
+  return `<opaque:${digest(value)}:${String(value).length}>`;
 }
 
-export function redactScalar(value, key = '') {
-  if (typeof value !== 'string') {
-    return OPAQUE_KEY.test(key) ? opaque(value) : value;
-  }
+/** A field whose value is withheld, preserving its name, type, and size. */
+function omitted(value) {
+  const type = value === null ? 'null' : typeof value;
+  const size = type === 'string' || type === 'number' ? `:${String(value).length}` : '';
+  return `<omitted:${type}${size}>`;
+}
+
+/** Publish a scalar only when its field is allowlisted; otherwise withhold it. */
+function projectScalar(value, key) {
+  if (value === null || value === undefined) return null;
   if (PERSONAL_KEY.test(key)) return '<redacted:personal>';
-  if (OPAQUE_KEY.test(key) || looksOpaque(value)) return opaque(value);
+  if (OPAQUE_KEY.test(key)) return opaque(value);
+  const type = typeof value;
+  if (type === 'object') return omitted(value);
+  if (type === 'number' || type === 'boolean') {
+    return SAFE_SCALAR_KEYS.has(key) ? value : omitted(value);
+  }
+  if (looksOpaque(value)) return opaque(value);
+  if (!SAFE_SCALAR_KEYS.has(key)) return omitted(value);
   return value.length > MAX_STRING ? `${value.slice(0, MAX_STRING)}<truncated>` : value;
 }
 
@@ -95,7 +153,7 @@ export function redactScalar(value, key = '') {
  */
 export function redactEvidence(value, key = '', depth = 0) {
   if (PERSONAL_KEY.test(key)) return '<redacted:personal>';
-  if (value === null || typeof value !== 'object') return redactScalar(value, key);
+  if (value === null || typeof value !== 'object') return projectScalar(value, key);
   if (OPAQUE_KEY.test(key)) return '<redacted:opaque-subtree>';
   if (depth >= MAX_DEPTH) return '<max-depth>';
   if (Array.isArray(value)) {
@@ -114,6 +172,21 @@ export function redactQuery(searchParams) {
     out[k] = CONTEXT_PARAMS.has(k) ? v : opaque(v);
   }
   return out;
+}
+
+/** Long or opaque path segments are identifiers too, so they are digested. */
+function sanitisePath(pathname) {
+  return pathname
+    .split('/')
+    .map((segment) => (looksOpaque(segment) || segment.length > MAX_PATH_SEGMENT ? opaque(segment) : segment))
+    .join('/');
+}
+
+export function redactUrl(rawUrl) {
+  const parsed = new URL(rawUrl);
+  const query = redactQuery(parsed.searchParams);
+  const suffix = Object.keys(query).length ? `?${new URLSearchParams(query)}` : '';
+  return `${parsed.origin}${sanitisePath(parsed.pathname)}${suffix}`;
 }
 
 /**
@@ -145,45 +218,67 @@ export function classifyRequest({
   return { action: 'allow' };
 }
 
-/** Cart-line view that keeps product identity and cart-line keys distinct. */
+/**
+ * Cart-line view that keeps product identity and cart-line keys distinct. Every
+ * field goes through the same allowlist projection as the rest of the evidence,
+ * so a nested value cannot bypass redaction.
+ */
 export function extractCartLines(body) {
   const items = body?.cart?.items;
   if (!Array.isArray(items)) return null;
   return items.map((item) => ({
-    productId: item?.id ?? null,
+    productId: projectScalar(item?.id, 'id'),
     productIdType: typeof item?.id,
     lineKey: typeof item?.key === 'string' ? opaque(item.key) : null,
-    type: item?.type ?? null,
-    quantity: item?.quantity ?? null,
-    sku: item?.sku ?? null,
-    name: item?.name ?? null,
-    price: item?.prices?.price ?? null,
-    currency: item?.prices?.currency_code ?? null,
-    minorUnit: item?.prices?.currency_minor_unit ?? null,
+    type: projectScalar(item?.type, 'type'),
+    quantity: projectScalar(item?.quantity, 'quantity'),
+    sku: projectScalar(item?.sku, 'sku'),
+    price: projectScalar(item?.prices?.price, 'price'),
+    currency: projectScalar(item?.prices?.currency_code, 'currency_code'),
+    minorUnit: projectScalar(item?.prices?.currency_minor_unit, 'currency_minor_unit'),
   }));
 }
 
 /**
- * Collapse byte-identical observations, keeping a repeat count. Storefronts
- * may poll the same read repeatedly; the repeat count is itself evidence.
+ * Collapse byte-identical observations, keeping a repeat count and the most
+ * recent position. Storefronts may poll the same read repeatedly; ordering must
+ * survive so the latest cart read stays the latest entry.
  */
 export function dedupeObservations(observations) {
   const seen = new Map();
   for (const observation of observations) {
     const key = JSON.stringify(observation);
     const existing = seen.get(key);
-    if (existing) existing.seen += 1;
-    else seen.set(key, { ...observation, seen: 1 });
+    if (existing) {
+      existing.seen += 1;
+      seen.delete(key);
+    }
+    seen.set(key, existing ?? { ...observation, seen: 1 });
   }
   return [...seen.values()];
 }
 
-export function redactUrl(rawUrl) {
-  const parsed = new URL(rawUrl);
-  const query = redactQuery(parsed.searchParams);
-  // JSON, not URLSearchParams: redacted values are objects, not strings.
-  const suffix = Object.keys(query).length ? `?${JSON.stringify(query)}` : '';
-  return `${parsed.origin}${parsed.pathname}${suffix}`;
+function resolveLocation(location, base) {
+  if (!location) return null;
+  try {
+    return new URL(location, base).href;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decide what to do with a fetched response. Redirects are never followed:
+ * Playwright does not re-route a redirect target, so following one would
+ * contact a URL the request gate never classified.
+ */
+export function classifyResponse({ status, location = null, baseUrl }) {
+  if (!REDIRECT_STATUS.has(status)) return { action: 'fulfill' };
+  return {
+    action: 'abort',
+    reason: 'redirect-not-followed',
+    destination: resolveLocation(location, baseUrl),
+  };
 }
 
 export function parseArgs(argv) {
@@ -219,6 +314,9 @@ Options:
 
 Reads only. See docs/integrations/landmark/signed-in-read-probe-procedure.md.`;
 
+const GUARD_DESCRIPTION =
+  'phase B: non-GET/HEAD to the retailer origin aborted; non-rendering cross-origin requests aborted; checkout/logout navigation blocked; redirects not followed';
+
 async function main(argv) {
   const opts = parseArgs(argv);
   if (opts.help) {
@@ -251,8 +349,7 @@ async function main(argv) {
       channel: opts.channel,
       startedAt: new Date().toISOString(),
       finishedAt: null,
-      readOnlyGuard:
-        'phase B: non-GET/HEAD to the retailer origin aborted; non-rendering cross-origin requests aborted; checkout/logout navigation blocked',
+      readOnlyGuard: GUARD_DESCRIPTION,
     },
     authorisation: {
       intendedAccountConfirmed: null,
@@ -284,6 +381,8 @@ async function main(argv) {
       '\nLandmark signed-in read-only probe.\n' +
         'This opens a dedicated isolated browser profile. Sign in there directly;\n' +
         'credentials and verification codes must never be typed into this terminal.\n' +
+        'Sign in and stop there: the read-only guard is not active until you confirm\n' +
+        'the account, so do not browse or click anything else in the storefront.\n' +
         `Profile: ${profileDir}\n`,
     );
 
@@ -321,7 +420,7 @@ async function main(argv) {
       if (parsed.origin !== RETAILER_ORIGIN || !parsed.pathname.startsWith('/api/')) return;
       const record = {
         method: req.method(),
-        path: parsed.pathname,
+        path: sanitisePath(parsed.pathname),
         query: redactQuery(parsed.searchParams),
         status: res.status(),
         requestHeaderNames: Object.keys(req.headers()).sort(),
@@ -335,7 +434,7 @@ async function main(argv) {
             .json()
             .then((body) => {
               // Extract line evidence from the raw body, then redact it; the
-              // extractor digests the cart-line key itself.
+              // extractor applies the same allowlist projection.
               const lines = extractCartLines(body);
               if (lines) record.cartLines = lines;
               record.body = redactEvidence(body);
@@ -347,6 +446,16 @@ async function main(argv) {
       }
     };
     page.on('response', onResponse);
+
+    const recordBlocked = (req, reason, extra = {}) => {
+      evidence.blockedRequests.push({
+        method: req.method(),
+        url: redactUrl(req.url()),
+        reason,
+        ...extra,
+      });
+    };
+
     await context.route('**/*', async (route) => {
       const req = route.request();
       const decision = classifyRequest({
@@ -356,15 +465,49 @@ async function main(argv) {
         resourceType: req.resourceType(),
       });
       if (decision.action === 'abort') {
-        evidence.blockedRequests.push({
-          method: req.method(),
-          url: redactUrl(req.url()),
-          reason: decision.reason,
+        recordBlocked(req, decision.reason);
+        await route.abort('blockedbyclient');
+        return;
+      }
+
+      let origin = null;
+      try {
+        origin = new URL(req.url()).origin;
+      } catch {
+        // classifyRequest already rejected unparseable URLs.
+      }
+      if (origin !== RETAILER_ORIGIN) {
+        // An allowed cross-origin rendering asset cannot reach the retailer
+        // origin, so it is outside the guarded redirect surface.
+        await route.continue();
+        return;
+      }
+
+      // Playwright routes only the first request of a redirect chain, so a
+      // redirect would otherwise be followed without another classification.
+      // Re-issue with redirects disabled and refuse to follow any of them; the
+      // destination is recorded instead.
+      let response;
+      try {
+        response = await route.fetch({ maxRedirects: 0 });
+      } catch (err) {
+        recordBlocked(req, `read-failed:${err.message}`);
+        await route.abort('blockedbyclient');
+        return;
+      }
+      const disposition = classifyResponse({
+        status: response.status(),
+        location: response.headers()['location'],
+        baseUrl: req.url(),
+      });
+      if (disposition.action === 'abort') {
+        recordBlocked(req, disposition.reason, {
+          destination: disposition.destination ? redactUrl(disposition.destination) : null,
         });
         await route.abort('blockedbyclient');
         return;
       }
-      await route.continue();
+      await route.fulfill({ response });
     });
 
     const flushObservations = async (ms = 1500) => {
@@ -372,96 +515,105 @@ async function main(argv) {
       await Promise.allSettled(pending.splice(0));
     };
 
-    console.log(
-      '\nRead-only capture is active: non-GET requests to landmark.ph are blocked.\n' +
-        'Do not click Add to Cart; the guard is a safety net, not a licence to mutate.\n',
-    );
-    await ask('5. Open your cart page in the browser, then press Enter here. ');
-    await flushObservations();
-    await ask(
-      '6. Open one simple, fixed-unit product page from the cart (click the product, not Add to Cart), then press Enter. ',
-    );
-    await flushObservations();
-
-    evidence.observations = dedupeObservations(evidence.observations);
-
-    evidence.session.cookies = (await context.cookies()).map((c) => ({
-      name: c.name,
-      domain: c.domain,
-      path: c.path,
-      httpOnly: c.httpOnly,
-      secure: c.secure,
-      sameSite: c.sameSite,
-      session: c.session,
-    }));
-    for (const open of context.pages()) {
-      if (!open.url().startsWith(RETAILER_ORIGIN)) continue;
-      const keys = await open
-        .evaluate(() => ({ localStorage: Object.keys(localStorage), sessionStorage: Object.keys(sessionStorage) }))
-        .catch(() => null);
-      evidence.session.storageKeys.push({ url: redactUrl(open.url()), keys });
-    }
-
-    const cartObs = evidence.observations.filter(
-      (o) => o.method === 'GET' && /^\/api\/cart(\/|$)/.test(o.path),
-    );
-    const cartRecord = cartObs.at(-1) ?? null;
-    if (!cartRecord) {
-      evidence.cart = { observed: false };
-      evidence.blockers.push('no GET /api/cart observation was captured');
+    if (!evidence.authorisation.intendedAccountConfirmed) {
+      evidence.blockers.push(
+        'operator did not confirm the intended account; stopped without prompting for or recording any cart or product read',
+      );
     } else {
-      const lines = cartRecord.cartLines ?? null;
-      evidence.cart = {
-        observed: true,
-        sourcePath: cartRecord.path,
-        query: cartRecord.query,
-        status: cartRecord.status,
-        requestHeaderNames: cartRecord.requestHeaderNames,
-        lineCount: Array.isArray(lines) ? lines.length : null,
-        lines,
-        body: cartRecord.body,
-      };
-      if (!lines || lines.length === 0) {
-        evidence.blockers.push(
-          'cart read succeeded but no populated cart lines were observed; a populated example is still required',
-        );
+      console.log(
+        '\nRead-only capture is active: non-GET requests and redirects are blocked.\n' +
+          'Do not click Add to Cart; the guard is a safety net, not a licence to mutate.\n',
+      );
+      await ask('5. Open your cart page in the browser, then press Enter here. ');
+      await flushObservations();
+      await ask(
+        '6. Open one simple, fixed-unit product page from the cart (click the product, not Add to Cart), then press Enter. ',
+      );
+      await flushObservations();
+
+      evidence.observations = dedupeObservations(evidence.observations);
+
+      evidence.session.cookies = (await context.cookies()).map((c) => ({
+        name: c.name,
+        domain: c.domain,
+        path: c.path,
+        httpOnly: c.httpOnly,
+        secure: c.secure,
+        sameSite: c.sameSite,
+        session: c.session,
+      }));
+      for (const open of context.pages()) {
+        if (!open.url().startsWith(RETAILER_ORIGIN)) continue;
+        const keys = await open
+          .evaluate(() => ({
+            localStorage: Object.keys(localStorage),
+            sessionStorage: Object.keys(sessionStorage),
+          }))
+          .catch(() => null);
+        evidence.session.storageKeys.push({ url: redactUrl(open.url()), keys });
       }
-    }
 
-    const detailObs = evidence.observations.filter(
-      (o) => o.method === 'GET' && /^\/api\/products\/\d+$/.test(o.path),
-    );
-    const lineIds = new Set((evidence.cart?.lines ?? []).map((l) => String(l.productId)));
-    const detailRecord =
-      detailObs.find((o) => lineIds.has(o.path.split('/').pop())) ?? detailObs.at(-1) ?? null;
-    if (!detailRecord) {
-      evidence.productDetail = { observed: false };
-      evidence.blockers.push('no GET /api/products/<id> observation was captured');
-    } else {
-      evidence.productDetail = {
-        observed: true,
-        sourcePath: detailRecord.path,
-        status: detailRecord.status,
-        requestHeaderNames: detailRecord.requestHeaderNames,
-        body: detailRecord.body,
-      };
-      const line =
-        (evidence.cart?.lines ?? []).find(
-          (l) => String(l.productId) === detailRecord.path.split('/').pop(),
-        ) ?? null;
-      const detail = detailRecord.body ?? {};
-      if (line) {
-        evidence.correspondence = {
-          productId: line.productId,
-          productIdTypeDifference: line.productIdType !== typeof detail.id,
-          skuMatch: line.sku != null && detail.sku != null ? line.sku === detail.sku : null,
-          typeMatch: line.type != null && detail.type != null ? line.type === detail.type : null,
-          cartPrice: { amount: line.price, currency: line.currency, minorUnit: line.minorUnit },
-          detailPrice: detail.priceRange?.minVariantPrice ?? null,
-          note: 'equality here is observed representation, not proof of identity rules',
-        };
+      const cartObs = evidence.observations.filter(
+        (o) => o.method === 'GET' && /^\/api\/cart(\/|$)/.test(o.path),
+      );
+      const cartRecord = cartObs.at(-1) ?? null;
+      if (!cartRecord) {
+        evidence.cart = { observed: false };
+        evidence.blockers.push('no GET /api/cart observation was captured');
       } else {
-        evidence.blockers.push('no cart line matched the captured product detail by id');
+        const lines = cartRecord.cartLines ?? null;
+        evidence.cart = {
+          observed: true,
+          sourcePath: cartRecord.path,
+          query: cartRecord.query,
+          status: cartRecord.status,
+          requestHeaderNames: cartRecord.requestHeaderNames,
+          lineCount: Array.isArray(lines) ? lines.length : null,
+          lines,
+          body: cartRecord.body,
+        };
+        if (!lines || lines.length === 0) {
+          evidence.blockers.push(
+            'cart read succeeded but no populated cart lines were observed; a populated example is still required',
+          );
+        }
+      }
+
+      const detailObs = evidence.observations.filter(
+        (o) => o.method === 'GET' && /^\/api\/products\/\d+$/.test(o.path),
+      );
+      const lineIds = new Set((evidence.cart?.lines ?? []).map((l) => String(l.productId)));
+      const detailRecord =
+        detailObs.find((o) => lineIds.has(o.path.split('/').pop())) ?? detailObs.at(-1) ?? null;
+      if (!detailRecord) {
+        evidence.productDetail = { observed: false };
+        evidence.blockers.push('no GET /api/products/<id> observation was captured');
+      } else {
+        evidence.productDetail = {
+          observed: true,
+          sourcePath: detailRecord.path,
+          status: detailRecord.status,
+          requestHeaderNames: detailRecord.requestHeaderNames,
+          body: detailRecord.body,
+        };
+        const line =
+          (evidence.cart?.lines ?? []).find(
+            (l) => String(l.productId) === detailRecord.path.split('/').pop(),
+          ) ?? null;
+        const detail = detailRecord.body ?? {};
+        if (line) {
+          evidence.correspondence = {
+            productId: line.productId,
+            productIdTypeDifference: line.productIdType !== typeof detail.id,
+            skuMatch: line.sku != null && detail.sku != null ? line.sku === detail.sku : null,
+            typeMatch: line.type != null && detail.type != null ? line.type === detail.type : null,
+            cartPrice: { amount: line.price, currency: line.currency, minorUnit: line.minorUnit },
+            detailPrice: detail.priceRange?.minVariantPrice ?? null,
+            note: 'equality here is observed representation, not proof of identity rules',
+          };
+        } else {
+          evidence.blockers.push('no cart line matched the captured product detail by id');
+        }
       }
     }
 
@@ -470,22 +622,32 @@ async function main(argv) {
         'some cross-origin requests were blocked; if the storefront rendered incorrectly, note it before rerunning',
       );
     }
+    if (evidence.blockedRequests.some((r) => r.reason === 'redirect-not-followed')) {
+      evidence.blockers.push(
+        'a redirect was blocked rather than followed; open the destination URL directly if that read is required',
+      );
+    }
   } finally {
     evidence.probe.finishedAt = new Date().toISOString();
-    fs.mkdirSync(outDir, { recursive: true });
-    const outFile = path.join(
-      outDir,
-      `landmark-read-probe-${new Date().toISOString().replace(/[:.]/g, '-')}.json`,
-    );
-    fs.writeFileSync(outFile, `${JSON.stringify(evidence, null, 2)}\n`);
-    rl.close();
-    if (!opts.keepOpen) await context.close().catch(() => {});
-    console.log(
-      `\nRedacted evidence written to ${outFile}\n` +
-        'Share only this file. Review it before sharing; it should contain no names,\n' +
-        'emails, addresses, session values, header values, or cart-line key values.\n' +
-        (opts.keepOpen ? 'The browser was left open as requested.\n' : ''),
-    );
+    try {
+      fs.mkdirSync(outDir, { recursive: true });
+      const outFile = path.join(
+        outDir,
+        `landmark-read-probe-${new Date().toISOString().replace(/[:.]/g, '-')}.json`,
+      );
+      fs.writeFileSync(outFile, `${JSON.stringify(evidence, null, 2)}\n`);
+      console.log(
+        `\nRedacted evidence written to ${outFile}\n` +
+          'Share only this file. Review it before sharing; it should contain no names,\n' +
+          'emails, addresses, session values, header values, or cart-line key values.\n' +
+          (opts.keepOpen ? 'The browser was left open as requested.\n' : ''),
+      );
+    } finally {
+      // Runs even when writing evidence fails, so the browser never outlives
+      // the probe on a bad output path.
+      rl.close();
+      if (!opts.keepOpen) await context.close().catch(() => {});
+    }
   }
 }
 

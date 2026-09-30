@@ -5,6 +5,7 @@ import {
   redactQuery,
   redactUrl,
   classifyRequest,
+  classifyResponse,
   extractCartLines,
   dedupeObservations,
   RETAILER_ORIGIN,
@@ -12,6 +13,7 @@ import {
 
 // The probe's only irrecoverable failure is leaking personal data or secrets
 // into the evidence file, so the redaction rules are the part worth checking.
+// Redaction is fail-closed: a field is published only if it is allowlisted.
 
 test('personal fields are collapsed entirely, without a linkable digest', () => {
   const redacted = redactEvidence({
@@ -25,16 +27,28 @@ test('personal fields are collapsed entirely, without a linkable digest', () => 
   assert.doesNotMatch(JSON.stringify(redacted), /shopper@example\.com|Ada|Example St/);
 });
 
+test('unknown field names withhold their values instead of publishing them', () => {
+  const redacted = redactEvidence({
+    profile: { name: 'Ada Lovelace' },
+    displayName: 'Ada',
+    messages: ['Your order is ready, Ada'],
+    meta_data: [{ key: 'note', value: 'call Ada on 0917' }],
+    loyaltyTier: 'gold',
+  });
+  const json = JSON.stringify(redacted);
+  assert.doesNotMatch(json, /Ada|Lovelace|0917|gold/);
+  // Structure survives, so the field is still evidence that it existed.
+  assert.equal(redacted.profile.name, '<omitted:string:12>');
+  assert.equal(redacted.displayName, '<omitted:string:3>');
+  assert.match(redacted.messages[0], /^<omitted:string:\d+>$/);
+  assert.equal(redacted.loyaltyTier, '<omitted:string:4>');
+});
+
 test('secrets and opaque identifiers become a digest plus length, never the value', () => {
   const nonce = 'e3efe0ad5b37b75621ec60cc1d3176ef';
   const redacted = redactEvidence({ nonce, customer_id: 39943 });
-  assert.deepEqual(redacted.nonce, { redacted: true, digest: redacted.nonce.digest, length: 32 });
-  assert.deepEqual(redacted.customer_id, {
-    redacted: true,
-    digest: redacted.customer_id.digest,
-    length: 5,
-  });
-  assert.equal(redactEvidence({ customer: { id: 1 } }).customer, '<redacted:opaque-subtree>');
+  assert.match(redacted.nonce, /^<opaque:[0-9a-f]{12}:32>$/);
+  assert.match(redacted.customer_id, /^<opaque:[0-9a-f]{12}:5>$/);
   assert.doesNotMatch(JSON.stringify(redacted), new RegExp(nonce));
 });
 
@@ -42,25 +56,24 @@ test('cart-line keys are digested even though their field name is generic', () =
   const key = 'a'.repeat(32);
   const redacted = redactEvidence({ items: [{ key, id: 39943 }] });
   assert.equal(redacted.items[0].id, 39943);
-  assert.equal(redacted.items[0].key.redacted, true);
-  assert.equal(redacted.items[0].key.length, 32);
+  assert.match(redacted.items[0].key, /^<opaque:[0-9a-f]{12}:32>$/);
   assert.doesNotMatch(JSON.stringify(redacted), new RegExp(key));
 });
 
-test('public catalogue fields survive redaction unchanged', () => {
+test('allowlisted catalogue fields survive redaction unchanged', () => {
   const redacted = redactEvidence({
     id: '27213',
     sku: 'MKT-14069',
-    title: 'Highlands Gold Corned Beef 150g',
-    price: 87.5,
-    currencyCode: 'Php',
+    type: 'simple',
+    availableForSale: true,
+    priceRange: { minVariantPrice: { amount: 87.5, currencyCode: 'Php' } },
   });
   assert.deepEqual(redacted, {
     id: '27213',
     sku: 'MKT-14069',
-    title: 'Highlands Gold Corned Beef 150g',
-    price: 87.5,
-    currencyCode: 'Php',
+    type: 'simple',
+    availableForSale: true,
+    priceRange: { minVariantPrice: { amount: 87.5, currencyCode: 'Php' } },
   });
 });
 
@@ -76,13 +89,19 @@ test('query redaction keeps context parameters and digests anything else', () =>
   );
   assert.equal(query.substoreAlias, 'mkt');
   assert.equal(query.page, '2');
-  assert.equal(query.searchKeywords.redacted, true);
+  assert.match(query.searchKeywords, /^<opaque:[0-9a-f]{12}:4>$/);
 });
 
-test('blocked-request URLs keep the context and never render an object as text', () => {
+test('URL redaction sanitises opaque path segments, not just the query', () => {
+  const lineKey = 'e3efe0ad5b37b75621ec60cc1d3176ef';
+  const url = redactUrl(`${RETAILER_ORIGIN}/api/cart/item/${lineKey}?substoreAlias=mkt`);
+  assert.doesNotMatch(url, new RegExp(lineKey));
+  assert.match(url, /<opaque:[0-9a-f]{12}:32>/);
+  assert.match(url, /substoreAlias=mkt/);
+});
+
+test('URL redaction never renders a redacted value as object text', () => {
   const url = redactUrl(`${RETAILER_ORIGIN}/api/cart/item?substoreAlias=mkt&searchKeywords=milk`);
-  assert.match(url, /substoreAlias/);
-  assert.match(url, /mkt/);
   assert.doesNotMatch(url, /object%20Object|object\+Object|\[object Object\]/);
   assert.doesNotMatch(url, /milk/);
 });
@@ -103,7 +122,12 @@ test('the read-only gate allows retailer reads and rendering assets', () => {
     { action: 'allow' },
   );
   assert.deepEqual(
-    classifyRequest({ ...base, method: 'GET', url: `${RETAILER_ORIGIN}/products/x/27213`, isNavigation: true }),
+    classifyRequest({
+      ...base,
+      method: 'GET',
+      url: `${RETAILER_ORIGIN}/products/x/27213`,
+      isNavigation: true,
+    }),
     { action: 'allow' },
   );
 });
@@ -132,6 +156,36 @@ test('the read-only gate aborts mutations, cross-origin calls, and checkout navi
   );
 });
 
+test('redirects are refused, so an unclassified destination is never contacted', () => {
+  assert.deepEqual(classifyResponse({ status: 200, baseUrl: `${RETAILER_ORIGIN}/api/cart` }), {
+    action: 'fulfill',
+  });
+  const toCheckout = classifyResponse({
+    status: 302,
+    location: '/checkout',
+    baseUrl: `${RETAILER_ORIGIN}/api/cart`,
+  });
+  assert.equal(toCheckout.action, 'abort');
+  assert.equal(toCheckout.reason, 'redirect-not-followed');
+  assert.equal(toCheckout.destination, `${RETAILER_ORIGIN}/checkout`);
+
+  const crossOrigin = classifyResponse({
+    status: 302,
+    location: 'https://evil.example/steal',
+    baseUrl: `${RETAILER_ORIGIN}/api/cart`,
+  });
+  assert.equal(crossOrigin.action, 'abort');
+  assert.equal(crossOrigin.destination, 'https://evil.example/steal');
+
+  const noLocation = classifyResponse({
+    status: 308,
+    location: null,
+    baseUrl: `${RETAILER_ORIGIN}/api/cart`,
+  });
+  assert.equal(noLocation.action, 'abort');
+  assert.equal(noLocation.destination, null);
+});
+
 test('cart-line extraction separates product identity from the cart-line key', () => {
   const lines = extractCartLines({
     cart: {
@@ -156,8 +210,29 @@ test('cart-line extraction separates product identity from the cart-line key', (
   assert.equal(lines[0].price, '46900');
   assert.equal(lines[0].currency, 'PHP');
   assert.equal(lines[0].minorUnit, 2);
-  assert.equal(lines[0].lineKey.redacted, true);
-  assert.doesNotMatch(JSON.stringify(lines), new RegExp('b'.repeat(32)));
+  assert.match(lines[0].lineKey, /^<opaque:[0-9a-f]{12}:32>$/);
+  assert.doesNotMatch(JSON.stringify(lines), /McCormick|b{32}/);
+});
+
+test('cart-line extraction cannot be used to publish a nested secret', () => {
+  const lines = extractCartLines({
+    cart: {
+      items: [
+        {
+          id: { token: 'secret-token-value' },
+          key: 'c'.repeat(32),
+          type: { token: 'secret-token-value' },
+          sku: { token: 'secret-token-value' },
+          prices: { price: { token: 'secret-token-value' } },
+        },
+      ],
+    },
+  });
+  assert.doesNotMatch(JSON.stringify(lines), /secret-token-value/);
+  assert.equal(lines[0].productId, '<omitted:object>');
+  assert.equal(lines[0].type, '<omitted:object>');
+  assert.equal(lines[0].sku, '<omitted:object>');
+  assert.equal(lines[0].price, '<omitted:object>');
 });
 
 test('cart-line extraction reports an empty cart rather than inventing lines', () => {
@@ -166,11 +241,25 @@ test('cart-line extraction reports an empty cart rather than inventing lines', (
   assert.equal(extractCartLines(null), null);
 });
 
-test('identical observations collapse into one entry with a repeat count', () => {
-  const read = { method: 'GET', path: '/api/cart', status: 200, body: { cart: { items: [] } } };
-  const other = { method: 'GET', path: '/api/products/1', status: 200, body: { id: 1 } };
-  const deduped = dedupeObservations([read, other, { ...read }]);
-  assert.equal(deduped.length, 2);
-  assert.equal(deduped[0].seen, 2);
-  assert.equal(deduped[1].seen, 1);
+test('identical observations collapse and the latest read keeps the latest position', () => {
+  const cartEmpty = { method: 'GET', path: '/api/cart', status: 200, body: { cart: { items: [] } } };
+  const detail = { method: 'GET', path: '/api/products/1', status: 200, body: { id: 1 } };
+  const cartPopulated = {
+    method: 'GET',
+    path: '/api/cart',
+    status: 200,
+    body: { cart: { items: [1] } },
+  };
+
+  // A -> B -> A leaves the final A last, so "latest cart read" is A, not B.
+  const reordered = dedupeObservations([cartEmpty, detail, { ...cartEmpty }]);
+  assert.equal(reordered.length, 2);
+  assert.equal(reordered[0].path, '/api/products/1');
+  assert.equal(reordered[0].seen, 1);
+  assert.equal(reordered.at(-1).path, '/api/cart');
+  assert.equal(reordered.at(-1).seen, 2);
+
+  // A changed cart read is a distinct observation and stays the latest.
+  const changed = dedupeObservations([cartEmpty, cartPopulated, { ...cartEmpty }]);
+  assert.equal(changed.at(-1).body.cart.items.length, 0);
 });

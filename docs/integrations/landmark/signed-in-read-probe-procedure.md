@@ -52,17 +52,29 @@ The probe opens a dedicated headed browser and walks through these steps. It
 pauses for Enter at each one.
 
 1. Sign in directly in the browser and confirm the intended account and branch.
-2. Confirm (y/N) that the signed-in account is the intended one.
+2. Confirm (y/N) that the signed-in account is the intended one. Answering N
+   stops the probe: it records a blocker and closes without reading the cart.
 3. Type the branch/location label the storefront shows (no personal data).
 4. Optionally add a free-text note about the context.
 5. Open the cart page in the browser. The probe records the resulting reads.
 6. Open one simple, fixed-unit product page **from the cart** (click the
    product, not Add to Cart).
 
-After step 4 the read-only guard is active: every non-GET/HEAD request to
-`landmark.ph` is aborted, non-rendering cross-origin requests are aborted, and
-checkout/logout navigation is blocked. The guard is a safety net, not a licence
-to mutate — do not click Add to Cart.
+The read-only guard is installed only after step 4, because sign-in itself is a
+POST that the guard would block. During steps 1–4 sign in and stop: do not
+browse or click anything else in the storefront, and do not follow any redirect
+the login flow offers.
+
+After step 4 the guard is active: every non-GET/HEAD request to `landmark.ph`
+is aborted, non-rendering cross-origin requests are aborted, checkout/logout
+navigation is blocked, and **redirects are never followed**. Playwright routes
+only the first request of a redirect chain, so following one would contact a URL
+the gate never classified; the probe re-issues each same-origin request with
+redirects disabled, refuses the redirect, and records its redacted destination.
+A blocked redirect is a blocker to read, not a silent failure — open the
+destination URL directly if that read is genuinely needed.
+
+The guard is a safety net, not a licence to mutate — do not click Add to Cart.
 
 Do not add items to manufacture a populated cart. If the cart is empty, that is
 the observation, and the probe records it as a blocker. An empty cart is not
@@ -92,20 +104,33 @@ Never recorded or emitted:
 
 - Cookie, header, session, nonce, or token values.
 - Names, emails, phones, addresses, or billing/shipping fields.
+- **Product and account names.** A `name` field cannot be told apart from a
+  person's name, so it is withheld. Identify products by `id` and `sku`.
+- Error or status message text; use the HTTP status and error `code` instead.
 - Cart-line key values. A cart line is represented by its product `id` plus a
   short digest and length for the line `key`, so runs can be correlated
   without publishing the key.
 - Page HTML, screenshots, traces, or raw network dumps.
 
-Redaction is enforced by `redactEvidence`, `redactQuery`, and
+Redaction is **fail-closed**: a value is published only when its field name is
+on a small allowlist (`id`, `sku`, `type`, `quantity`, `price`, `amount`,
+`currency_code`, `currency_minor_unit`, `substoreAlias`, and similar). Every
+other field keeps its name, type, and size but not its value, for example
+`"name": "<omitted:string:12>"`. Opaque identifiers and secrets become
+`"<opaque:digest:length>"`; personal fields become `"<redacted:personal>"`.
+Long or opaque URL path segments are digested too, not just the query string.
+
+Redaction is enforced by `redactEvidence`, `redactQuery`, `redactUrl`, and
 `extractCartLines` in [scripts/landmark-probe.js](../../../scripts/landmark-probe.js),
 covered by `test/landmark-probe.test.js`.
 
 ## Review before sharing
 
 Open the evidence file and confirm it contains no name, email, address, phone,
-cookie value, header value, nonce, token, or 32-hex cart-line key. Share only
-that file, not the profile directory.
+cookie value, header value, nonce, token, or 32-hex cart-line key. Every
+withheld value appears as `<omitted:…>`, `<opaque:…>`, or `<redacted:…>`, so an
+unexpected literal is easy to spot. Share only that file, not the profile
+directory.
 
 ## Synthetic example of the evidence shape
 
@@ -134,31 +159,33 @@ of Landmark and must not be cited as one.
         {
           "productId": 39943,
           "productIdType": "number",
-          "lineKey": { "redacted": true, "digest": "<12 hex>", "length": 32 },
+          "lineKey": "<opaque:5d72f08b0e17:32>",
           "type": "simple",
           "quantity": 1,
           "sku": "<public sku>",
-          "name": "<public product name>",
           "price": "46900",
           "currency": "PHP",
           "minorUnit": 2
         }
       ],
-      "body": { "cart": { "items": ["<redacted lines as above>"], "itemsCount": 1, "total": "<money>", "coupon": "" }, "nonce": { "redacted": true, "digest": "<12 hex>", "length": 32 }, "customer": "<redacted:opaque-subtree>" }
+      "body": { "cart": { "items": ["<as above>"], "itemsCount": 1, "total": 46900 }, "nonce": "<opaque:bdb339768bc5:32>", "customer": "<redacted:opaque-subtree>", "profile": { "name": "<omitted:string:12>" }, "meta_data": [{ "key": "<opaque:edb465624291:4>", "value": "<omitted:string:9>" }] }
     }
   ],
   "cart": { "observed": true, "sourcePath": "/api/cart", "lineCount": 1, "lines": ["<as above>"] },
-  "productDetail": { "observed": true, "sourcePath": "/api/products/39943", "status": 200, "body": { "id": 39943, "type": "simple", "sku": "<public sku>", "priceRange": { "minVariantPrice": { "amount": "469", "currencyCode": "Php" } } } },
+  "productDetail": { "observed": true, "sourcePath": "/api/products/39943", "status": 200, "body": { "id": 39943, "type": "simple", "sku": "<public sku>", "title": "<omitted:string:34>", "priceRange": { "minVariantPrice": { "amount": 469, "currencyCode": "Php" } } } },
   "correspondence": {
     "productId": 39943,
     "productIdTypeDifference": false,
     "skuMatch": true,
     "typeMatch": true,
     "cartPrice": { "amount": "46900", "currency": "PHP", "minorUnit": 2 },
-    "detailPrice": { "amount": "469", "currencyCode": "Php" },
+    "detailPrice": { "amount": 469, "currencyCode": "Php" },
     "note": "equality here is observed representation, not proof of identity rules"
   },
-  "blockedRequests": [{ "method": "POST", "url": "https://www.landmark.ph/api/cart/item", "reason": "non-read-method:POST" }],
+  "blockedRequests": [
+    { "method": "POST", "url": "https://www.landmark.ph/api/cart/item", "reason": "non-read-method:POST" },
+    { "method": "GET", "url": "https://www.landmark.ph/api/cart", "reason": "redirect-not-followed", "destination": "https://www.landmark.ph/checkout" }
+  ],
   "blockers": []
 }
 ```
@@ -173,6 +200,10 @@ of Landmark and must not be cited as one.
 | Cart line ↔ catalogue/detail correspondence | `correspondence` | At least one supported simple, fixed-unit product in the cart |
 | Read prerequisites | `observations[].requestHeaderNames`, `status`, `blockedRequests` | Comparing a successful read with a deliberately expired/absent session, which this run does not induce |
 | Expired auth / wrong context / cart-read failure signals | `blockedRequests`, non-200 `observations`, `blockers` | Observed failure cases; the probe does not force them |
+
+Product names are withheld, so use `id`/`sku` to identify a line. A blocked
+`redirect-not-followed` entry with a login destination is itself evidence that
+the session had expired.
 
 A simple, fixed-unit product does not establish variant, open-weight, or
 package-size semantics. Record those as unresolved unless a matching example is
