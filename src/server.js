@@ -40,6 +40,7 @@ const STATUS_BY_CODE = {
   'no-approval': 409,
   'already-executed': 409,
   'invalid-approval': 409,
+  'stale-review': 409,
   'invalid-selection': 400,
   invalid: 400,
   'not-found': 404,

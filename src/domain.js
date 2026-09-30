@@ -114,15 +114,24 @@ export function classify(item, prod) {
   const sizeOk = !sizeSpecified || sizeEquals(item.size, prod.size);
   const variantOk = !variantSpecified || sameText(item.variant, prod.variant);
 
-  if (!brandOk) {
-    if (item.restrictions?.noSubstitution) {
+  // ADR-0007: an explicit no-substitution prohibition blocks any specified
+  // attribute that differs (brand, variant, or size), not just the brand.
+  if (item.restrictions?.noSubstitution) {
+    const differences = [];
+    if (brandSpecified && !brandOk) differences.push(`brand (${prod.brand})`);
+    if (variantSpecified && !variantOk) differences.push(`variant (${prod.variant})`);
+    if (sizeSpecified && !sizeOk) differences.push(`size (${prod.size.display})`);
+    if (differences.length) {
       return {
         product: productView(prod),
         color: 'red',
         selectable: false,
-        reason: `Explicit no-substitution: ${prod.brand} differs from ${item.brand}; revise the request to select it.`,
+        reason: `Explicit no-substitution: ${differences.join(', ')} differs from the request; revise the request to select it.`,
       };
     }
+  }
+
+  if (!brandOk) {
     return {
       product: productView(prod),
       color: 'orange',
@@ -261,7 +270,18 @@ export function verifyCart(plan, cart, catalog = CATALOG) {
   for (const action of plan.actions) {
     const observed = cart[action.productId] ?? 0;
     if (action.kind === 'none') {
-      fulfilled.push({ itemId: action.itemId, productId: action.productId, target: action.target, observed });
+      // No mutation was planned, but the observed cart is still evidence.
+      if (observed === action.target) {
+        fulfilled.push({ itemId: action.itemId, productId: action.productId, target: action.target, observed });
+      } else {
+        discrepancies.push({
+          itemId: action.itemId,
+          productId: action.productId,
+          expected: action.target,
+          observed,
+          note: 'No mutation was planned, but the observed quantity does not match the target.',
+        });
+      }
       continue;
     }
     if (action.kind === 'reduce' && !action.executable) {

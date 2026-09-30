@@ -106,6 +106,8 @@ test('the documented flow works over HTTP and a duplicate execute is rejected', 
       headers,
       body: JSON.stringify({ selections: SELECTIONS }),
     });
+    const reviewed = await fetch(`${base}/api/run/${run.runId}/plan`, { method: 'POST', headers });
+    assert.equal(reviewed.status, 200);
     const approved = await fetch(`${base}/api/run/${run.runId}/approve`, { method: 'POST', headers });
     assert.equal(approved.status, 200);
 
@@ -133,6 +135,7 @@ test('execution continues after the review tab disconnects and is not replayed o
         headers,
         body: JSON.stringify({ selections: SELECTIONS }),
       });
+      await fetch(`${base}/api/run/${run.runId}/plan`, { method: 'POST', headers });
       await fetch(`${base}/api/run/${run.runId}/approve`, { method: 'POST', headers });
 
       const controller = new AbortController();

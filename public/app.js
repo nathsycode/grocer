@@ -259,6 +259,7 @@ function canApprove(run) {
       run.plan.revision === run.revision &&
       !run.approvalConsumed &&
       !run.approvalValid &&
+      !run.inFlight &&
       !snapshot.blocked &&
       !snapshot.ownership.executing &&
       run.status !== 'completed',
@@ -270,6 +271,7 @@ function canExecute(run) {
     run.approval &&
       run.approvalValid &&
       !run.approvalConsumed &&
+      !run.inFlight &&
       !snapshot.blocked &&
       !snapshot.ownership.executing,
   );

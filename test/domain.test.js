@@ -154,3 +154,22 @@ test('revalidation pauses on a concurrent cart change or a price rise', () => {
   const revisionChanged = revalidateApproval(approval, { revision: 2, contextId: 'ctx', cart: { 'hl-beef-150g': 1 } });
   assert.equal(revisionChanged.ok, false);
 });
+
+test('an explicit no-substitution prohibition blocks a different specified size', () => {
+  const restricted = item({ restrictions: { noSubstitution: true } });
+  const c = discoverCandidates(restricted).find((x) => x.product.id === 'hl-beef-260g');
+  assert.equal(c.color, 'red');
+  assert.equal(c.selectable, false);
+});
+
+test('a none action is a discrepancy when the observed cart does not match', () => {
+  const plan = {
+    actions: [
+      { itemId: 'item-1', productId: 'hl-beef-150g', kind: 'none', target: 2, existing: 2, to: 2, executable: true },
+    ],
+    unfulfilled: [],
+  };
+  const result = verifyCart(plan, { 'hl-beef-150g': 0 });
+  assert.equal(result.fulfilled.length, 0);
+  assert.equal(result.discrepancies.length, 1);
+});

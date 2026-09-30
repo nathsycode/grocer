@@ -1,6 +1,10 @@
 // Local simulated retailer: the smallest rehearsal boundary. Pure local JSON,
 // no network, no account/session data. It stands in for the future Landmark
 // integration so cart-change behaviour can be rehearsed safely.
+//
+// State is read from disk on every operation and never cached in memory: two
+// long-lived processes/entry points may share this file, and a stale in-memory
+// copy would let one overwrite the other's committed changes and evidence.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -16,15 +20,10 @@ export class Simulator {
   constructor(filePath, { faults = {} } = {}) {
     this.filePath = filePath;
     this.faults = faults;
-    this.state = null;
   }
 
   #load() {
-    if (this.state) return this.state;
-    if (!fs.existsSync(this.filePath)) {
-      this.state = { cart: {}, ops: {} };
-      return this.state;
-    }
+    if (!fs.existsSync(this.filePath)) return { cart: {}, ops: {} };
     let parsed;
     try {
       parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
@@ -33,12 +32,10 @@ export class Simulator {
     }
     parsed.cart ??= {};
     parsed.ops ??= {};
-    this.state = parsed;
-    return this.state;
+    return parsed;
   }
 
-  #save() {
-    const state = this.#load();
+  #save(state) {
     const tmp = `${this.filePath}.tmp`;
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
     const fd = fs.openSync(tmp, 'w');
@@ -54,11 +51,16 @@ export class Simulator {
   seedCart(cart) {
     const state = this.#load();
     state.cart = { ...cart };
-    this.#save();
+    this.#save(state);
   }
 
   exists() {
     return fs.existsSync(this.filePath);
+  }
+
+  /** True when any operation has ever been recorded (durable evidence exists). */
+  hasOperations() {
+    return Object.keys(this.#load().ops).length > 0;
   }
 
   cart() {
@@ -78,24 +80,24 @@ export class Simulator {
 
     if (mode === 'fail-before') {
       state.ops[opId] = { status: 'not-applied' };
-      this.#save();
+      this.#save(state);
       throw new Error('simulated retailer rejected the request before applying it');
     }
     if (mode === 'timeout-not-applied') {
       state.ops[opId] = { status: 'not-applied' };
-      this.#save();
+      this.#save(state);
       throw new SimTimeoutError('simulated timeout; mutation not applied');
     }
     if (mode === 'timeout-unknown') {
       state.ops[opId] = { status: 'unknown' };
-      this.#save();
+      this.#save(state);
       throw new SimTimeoutError('simulated timeout; application outcome unknown');
     }
 
     if (to <= 0) delete state.cart[productId];
     else state.cart[productId] = to;
     state.ops[opId] = { status: 'applied' };
-    this.#save();
+    this.#save(state);
 
     if (mode === 'timeout-applied') throw new SimTimeoutError('simulated timeout; mutation applied');
     return { status: 'applied' };

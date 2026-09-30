@@ -69,6 +69,7 @@ export function reduce(records) {
           plan: null,
           approval: null,
           approvalValid: false,
+          inFlight: false,
           status: 'review',
           pauseReason: null,
           verification: null,
@@ -126,7 +127,10 @@ export function reduce(records) {
         ownership.since = r.ts;
         break;
       case 'execution_started':
-        if (run) run.status = 'executing';
+        if (run) {
+          run.status = 'executing';
+          run.inFlight = true;
+        }
         break;
       case 'mutation_intent':
         attempts[r.opId] = {
@@ -165,12 +169,14 @@ export function reduce(records) {
           run.pauseReason = r.reason;
           // A paused run cannot silently reuse its earlier approval.
           run.approvalValid = false;
+          run.inFlight = false;
         }
         break;
       case 'execution_completed':
         if (run) {
           run.status = 'completed';
           run.approvalConsumed = true;
+          run.inFlight = false;
         }
         break;
       default:
@@ -210,16 +216,58 @@ export class Store {
   }
 
   load() {
-    this.refresh();
     this.retailerFatal = null;
-    try {
-      this.simulator.cart();
-    } catch (err) {
-      // Cannot read the simulated retailer state: treat as fail-closed.
-      this.retailerFatal = { reason: err.message };
+    this.refresh();
+    // A missing journal is only a fresh start when no prior state exists.
+    // A leftover lock or recorded simulator operations mean history is
+    // expected: fail closed rather than treating deletion as a clean slate.
+    if (!this.fatal && !this.journal.exists()) {
+      let priorState = this.lock.held();
+      if (!priorState) {
+        try {
+          priorState = this.simulator.hasOperations();
+        } catch (err) {
+          this.retailerFatal = { reason: err.message };
+        }
+      }
+      if (priorState) {
+        this.fatal = { reason: 'the safety journal is missing while prior state exists; failing closed' };
+      }
     }
+    if (!this.retailerFatal) {
+      try {
+        this.simulator.cart();
+      } catch (err) {
+        // Cannot read the simulated retailer state: treat as fail-closed.
+        this.retailerFatal = { reason: err.message };
+      }
+    }
+    if (!this.fatal && !this.retailerFatal) this.invalidateForeignApproval();
     this.settleStaleLock();
     return this.snapshot();
+  }
+
+  /**
+   * A backend restart must not carry an old approval into a new process
+   * (ADR-0008). If ownership survives from a process other than this one, the
+   * owning run's approval is invalidated once.
+   */
+  invalidateForeignApproval() {
+    if (!this.state.ownership.held) return;
+    const ownerRunId = this.state.ownership.runId;
+    const run = ownerRunId ? this.state.runs[ownerRunId] : null;
+    if (!run?.approval || !run.approvalValid) return;
+    const holder = this.lock.holder();
+    if (holder && holder.pid === process.pid) return;
+    try {
+      this.#append('approval_invalidated', {
+        runId: ownerRunId,
+        reason: 'backend restarted while execution ownership was held; fresh approval required',
+      });
+      this.refresh();
+    } catch {
+      /* storage failing; the run remains blocked by its ownership record */
+    }
   }
 
   refresh() {
@@ -279,6 +327,13 @@ export class Store {
         kind: 'uncertain',
         reason:
           'An unresolved mutation attempt keeps execution blocked. Reconcile against the simulator to resolve it safely.',
+      };
+    }
+    if (this.state.ownership.held && !this.executing) {
+      return {
+        kind: 'ownership',
+        reason:
+          'A paused or interrupted run retains execution ownership. Reconcile (read-only) to release it before a new execution.',
       };
     }
     return null;
@@ -356,6 +411,7 @@ export class Store {
     if (this.fatal) throw new StoreError('blocked', this.fatal.reason);
     if (this.retailerFatal) throw new StoreError('blocked', this.blockState().reason);
     if (this.state.openAttempts.length > 0) throw new StoreError('blocked', this.blockState().reason);
+    if (this.state.ownership.held && !this.executing) throw new StoreError('blocked', this.blockState().reason);
     if (this.executing) throw new StoreError('owned', 'a cart-changing run is executing');
   }
 
@@ -430,8 +486,28 @@ export class Store {
   approvePlan(runId) {
     this.assertPlanningAllowed();
     const run = this.requireRun(runId);
-    const plan = this.reviewPlan(runId);
-    const actions = executableActions(plan).map((a) => ({
+    const reviewed = run.plan;
+    if (!reviewed || reviewed.revision !== run.revision) {
+      throw new StoreError('stale-review', 'review the plan before approving it');
+    }
+    // Approval must bind to the plan the operator actually reviewed. Recompute
+    // only to detect that the observed inputs have moved on; never approve the
+    // replacement plan that recomputation would produce.
+    const current = computePlan(
+      run.items,
+      run.selections,
+      this.simulator.cart(),
+      this.context.contextId,
+      run.revision,
+      this.catalog,
+    );
+    if (planFingerprint(reviewed) !== planFingerprint(current)) {
+      const reason = 'the reviewed plan no longer matches the observed cart, prices, or selections';
+      this.#append('approval_invalidated', { runId, reason });
+      this.refresh();
+      throw new StoreError('stale-review', `${reason}; review the plan again before approving`);
+    }
+    const actions = executableActions(reviewed).map((a) => ({
       itemId: a.itemId,
       productId: a.productId,
       product: a.product,
@@ -460,10 +536,13 @@ export class Store {
     if (this.retailerFatal) throw new StoreError('blocked', this.blockState().reason);
     const run = this.requireRun(runId);
     if (this.state.openAttempts.length > 0) throw new StoreError('blocked', this.blockState().reason);
-    if (this.state.ownership.held && this.state.ownership.runId !== runId) {
-      throw new StoreError('owned', 'another cart-changing run owns execution');
-    }
     if (this.executing) throw new StoreError('owned', 'this run is already executing');
+    if (run.inFlight) {
+      throw new StoreError('blocked', 'this run was interrupted before it finished; reconcile and start a fresh run');
+    }
+    if (this.state.ownership.held) {
+      throw new StoreError('owned', 'execution ownership is held; reconcile to release it before executing');
+    }
     if (!run.approval) throw new StoreError('no-approval', 'the plan must be explicitly approved before execution');
     if (run.approvalConsumed) throw new StoreError('already-executed', 'this approval has already been executed');
     if (!run.approvalValid) {
@@ -483,13 +562,22 @@ export class Store {
       throw new StoreError('invalid-approval', `reevaluation required: ${check.problems.join('; ')}`);
     }
 
-    if (!this.state.ownership.held) {
-      try {
-        this.lock.acquire({ runId });
-      } catch {
-        throw new StoreError('owned', 'another process already owns cart-changing execution');
-      }
+    // Always acquire a fresh lock: a lock left by another process/entry point is
+    // never silently reused to continue that owner's run.
+    try {
+      this.lock.acquire({ runId });
+    } catch {
+      throw new StoreError('owned', 'another process already owns cart-changing execution');
+    }
+    try {
       this.#append('ownership_acquired', { runId, ownerPid: process.pid });
+    } catch (err) {
+      try {
+        this.lock.release();
+      } catch {
+        /* best effort */
+      }
+      throw err;
     }
 
     this.executing = true;
@@ -605,7 +693,21 @@ export class Store {
   reconcile(runId) {
     if (this.fatal) throw new StoreError('blocked', this.fatal.reason);
     if (this.retailerFatal) throw new StoreError('blocked', this.blockState().reason);
+    if (this.executing) throw new StoreError('owned', 'cannot reconcile while this process is executing a run');
     const run = this.requireRun(runId);
+
+    // Never release a lock that another live process still owns: it may be
+    // between actions, with no unresolved attempt recorded yet.
+    const holder = this.lock.holder();
+    if (holder && Number.isInteger(holder.pid) && holder.pid !== process.pid && isProcessAlive(holder.pid)) {
+      return {
+        reconciled: true,
+        stillBlocked: true,
+        reason: 'another process currently owns cart-changing execution; not releasing it',
+        snapshot: this.snapshot(),
+      };
+    }
+
     const cart = this.simulator.cart();
     this.#append('cart_observed', { runId, cart, contextId: this.context.contextId, phase: 'reconciliation' });
 
@@ -674,16 +776,56 @@ function summarizeRecord(type, rest) {
 }
 
 function normalizeCorrection(raw, catalog) {
+  if (!raw || typeof raw !== 'object') throw new StoreError('invalid', 'each item must be an object');
   const prod = raw.productId ? productById(raw.productId, catalog) : null;
-  const quantity = Number.parseInt(raw.quantity, 10);
+
+  const quantityText = String(raw.quantity ?? '').trim();
+  if (!/^\d+$/.test(quantityText) || Number(quantityText) < 1) {
+    throw new StoreError('invalid', `target quantity must be a positive whole number (received ${JSON.stringify(raw.quantity)})`);
+  }
+
+  let size;
+  if (raw.sizeText !== undefined) {
+    const text = String(raw.sizeText).trim();
+    if (text === '') {
+      size = null;
+    } else {
+      size = parseSize(text);
+      if (!size || size.value <= 0) {
+        throw new StoreError('invalid', `size ${JSON.stringify(raw.sizeText)} is not a recognised size (for example 500 g, 1 kg, 500 ml)`);
+      }
+    }
+  } else if (raw.size != null) {
+    size = raw.size;
+  } else {
+    size = null;
+  }
+
+  const name = String(raw.name ?? '').trim();
+  if (!name) throw new StoreError('invalid', 'item name is required');
+
   return {
     id: raw.id ?? `item-${crypto.randomUUID().slice(0, 8)}`,
     raw: raw.raw ?? '',
-    name: raw.name || prod?.name || 'Item',
-    brand: raw.brand || null,
-    variant: raw.variant || null,
-    size: raw.sizeText !== undefined ? parseSize(raw.sizeText) : (raw.size ?? prod?.size ?? null),
-    quantity: Number.isInteger(quantity) && quantity > 0 ? quantity : 1,
+    name,
+    brand: optionalText(raw.brand),
+    variant: optionalText(raw.variant),
+    size,
+    quantity: Number.parseInt(quantityText, 10),
     restrictions: { noSubstitution: Boolean(raw.restrictions?.noSubstitution ?? raw.noSubstitution) },
   };
+}
+
+function optionalText(value) {
+  const text = String(value ?? '').trim();
+  return text ? text : null;
+}
+
+/** Stable fingerprint of the plan inputs an operator reviews, excluding timestamps. */
+function planFingerprint(plan) {
+  const actions = plan.actions
+    .map((a) => `${a.itemId}|${a.productId}|${a.kind}|${a.from}|${a.to}|${a.priceMinor}|${a.executable}`)
+    .sort();
+  const unfulfilled = plan.unfulfilled.map((u) => u.itemId).sort();
+  return JSON.stringify({ revision: plan.revision, contextId: plan.contextId, actions, unfulfilled });
 }
