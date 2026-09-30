@@ -188,3 +188,148 @@ test('the session never stores account or session data in the journal', async ()
   );
   assert.ok(!fs.existsSync(path.join(dataDir, 'journal.jsonl')));
 });
+
+// --- Review fixes: stale authority, missing context, and redirect gaps ------
+
+test('a later verification exception resets authority instead of retaining it', async () => {
+  let mode = 'ok';
+  const driver = fakeDriver({
+    async sessionInfo() {
+      if (mode === 'throw') throw new Error('browser crashed');
+      return { signedIn: true, expired: false, account: 'intended-account', branch: 'intended-branch', problems: [] };
+    },
+  });
+  await withSession(
+    async ({ session }) => {
+      assert.equal((await session.verifyContext()).verified, true);
+      mode = 'throw';
+      const after = await session.verifyContext();
+      assert.equal(after.verified, false);
+      const cart = await session.readCart();
+      assert.equal(cart.ok, false, 'a failed re-verification must revoke read authority');
+    },
+    { driver },
+  );
+});
+
+test('verification is refused when no intended context is configured', async () => {
+  await withSession(
+    async ({ session }) => {
+      const status = await session.verifyContext();
+      assert.equal(status.verified, false);
+      assert.ok(status.problems.some((p) => /intended account|intended branch|configured/i.test(p)));
+    },
+    { expected: {} },
+  );
+});
+
+test('a read that returns a different context than the verified one fails closed', async () => {
+  const driver = fakeDriver({
+    async readCart() {
+      return {
+        context: { account: 'someone-else', branch: 'intended-branch' },
+        lines: [{ productId: '39943', quantity: 1, money: { minor: 46900, currency: 'PHP' } }],
+        problems: [],
+      };
+    },
+  });
+  await withSession(
+    async ({ session }) => {
+      await session.verifyContext();
+      const cart = await session.readCart();
+      assert.equal(cart.ok, false);
+      assert.ok(cart.problems.some((p) => /context/i.test(p)));
+    },
+    { driver },
+  );
+});
+
+test('a read that reports failure notes fails closed', async () => {
+  const driver = fakeDriver({
+    async readCart() {
+      return { context: { account: 'intended-account', branch: 'intended-branch' }, lines: [], problems: ['partial cart response'] };
+    },
+  });
+  await withSession(
+    async ({ session }) => {
+      await session.verifyContext();
+      const cart = await session.readCart();
+      assert.equal(cart.ok, false);
+      assert.ok(cart.problems.some((p) => /partial/i.test(p)));
+    },
+    { driver },
+  );
+});
+
+test('redirect refusal applies to cross-origin assets too', async () => {
+  const { applyReadOnlyRoute } = await import('../src/retailer/session.js');
+  const calls = { abort: 0, continue: 0, fulfill: 0 };
+  const route = {
+    request: () => ({
+      method: () => 'GET',
+      url: () => 'https://cdn.example.com/app.js',
+      isNavigationRequest: () => false,
+      resourceType: () => 'script',
+    }),
+    fetch: async () => ({ status: () => 302, headers: () => ({ location: 'https://evil.example.com/app.js' }) }),
+    abort: async () => {
+      calls.abort += 1;
+    },
+    continue: async () => {
+      calls.continue += 1;
+    },
+    fulfill: async () => {
+      calls.fulfill += 1;
+    },
+  };
+  await applyReadOnlyRoute(route, { retailerOrigin: 'https://www.landmark.ph' });
+  assert.equal(calls.abort, 1);
+  assert.equal(calls.continue, 0);
+  assert.equal(calls.fulfill, 0);
+});
+
+test('an allowed same-origin read is fulfilled', async () => {
+  const { applyReadOnlyRoute } = await import('../src/retailer/session.js');
+  const calls = { abort: 0, continue: 0, fulfill: 0 };
+  const route = {
+    request: () => ({
+      method: () => 'GET',
+      url: () => 'https://www.landmark.ph/api/cart',
+      isNavigationRequest: () => false,
+      resourceType: () => 'fetch',
+    }),
+    fetch: async () => ({ status: () => 200, headers: () => ({}) }),
+    abort: async () => {
+      calls.abort += 1;
+    },
+    continue: async () => {
+      calls.continue += 1;
+    },
+    fulfill: async () => {
+      calls.fulfill += 1;
+    },
+  };
+  await applyReadOnlyRoute(route, { retailerOrigin: 'https://www.landmark.ph' });
+  assert.equal(calls.fulfill, 1);
+  assert.equal(calls.abort, 0);
+});
+
+test('a non-read method is aborted', async () => {
+  const { applyReadOnlyRoute } = await import('../src/retailer/session.js');
+  const calls = { abort: 0 };
+  const route = {
+    request: () => ({
+      method: () => 'POST',
+      url: () => 'https://www.landmark.ph/api/cart/item',
+      isNavigationRequest: () => false,
+      resourceType: () => 'fetch',
+    }),
+    fetch: async () => ({ status: () => 200, headers: () => ({}) }),
+    abort: async () => {
+      calls.abort += 1;
+    },
+    fulfill: async () => {},
+  };
+  await applyReadOnlyRoute(route, { retailerOrigin: 'https://www.landmark.ph' });
+  assert.equal(calls.abort, 1);
+});

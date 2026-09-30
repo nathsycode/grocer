@@ -39,27 +39,30 @@ export function normalizeProductId(value) {
   return null;
 }
 
-function formatMinor(minor, currency) {
-  const exponent = CURRENCY_MINOR_UNITS[currency];
-  if (exponent === undefined) return null;
+function formatMinor(minor, currency, exponent) {
+  if (!Number.isInteger(exponent) || exponent < 0) return null;
   return `${currency} ${(minor / 10 ** exponent).toFixed(exponent)}`;
 }
 
 /**
  * Normalize one monetary observation.
  *
- * `minorUnit` present means the amount is already in minor units and must not
- * be rescaled. Its absence means the amount is a major-unit value, scaled by
- * the currency's known exponent. Anything else is unresolved, never guessed.
+ * The caller must state the endpoint scale. `scale: 'minor'` (cart) requires a
+ * valid `minorUnit`; `scale: 'major'` (search/detail) scales by the currency's
+ * known exponent. A bare amount with no scale and no exponent is ambiguous and
+ * stays unresolved, because guessing silently changes the price by 100x. The
+ * supplied exponent is also used for display, not a currency default.
  */
-export function normalizeMoney({ amount, currency, minorUnit } = {}) {
+export function normalizeMoney({ amount, currency, minorUnit, scale } = {}) {
   const code = typeof currency === 'string' && currency.trim() ? currency.trim().toUpperCase() : null;
-  const numeric = typeof amount === 'string' ? Number(amount.trim()) : amount;
+  const trimmed = typeof amount === 'string' ? amount.trim() : amount;
+  const numeric = typeof trimmed === 'string' ? Number(trimmed) : trimmed;
   const base = {
     currency: code,
     observedCurrency: currency ?? null,
     observedAmount: amount ?? null,
     observedMinorUnit: minorUnit ?? null,
+    observedScale: scale ?? null,
     format: null,
     minor: null,
     display: null,
@@ -67,6 +70,9 @@ export function normalizeMoney({ amount, currency, minorUnit } = {}) {
     reason: null,
   };
 
+  if (trimmed === '' || trimmed === null || trimmed === undefined) {
+    return { ...base, reason: 'amount is missing' };
+  }
   if (!Number.isFinite(numeric)) {
     return { ...base, reason: 'amount is not a finite number' };
   }
@@ -74,39 +80,42 @@ export function normalizeMoney({ amount, currency, minorUnit } = {}) {
     return { ...base, reason: 'currency is missing' };
   }
 
-  if (Number.isInteger(minorUnit) && minorUnit >= 0) {
+  const useMinor = scale === 'minor' || (scale === undefined && minorUnit !== undefined && minorUnit !== null);
+  if (useMinor) {
+    if (!Number.isInteger(minorUnit) || minorUnit < 0) {
+      return { ...base, format: 'minor', reason: 'a minor-unit amount was supplied without a valid currency_minor_unit' };
+    }
     const minor = Math.round(numeric);
-    return {
-      ...base,
-      format: 'minor',
-      minor,
-      display: formatMinor(minor, code) ?? `${code} ${numeric}`,
-      unresolved: false,
-    };
+    return { ...base, format: 'minor', minor, display: formatMinor(minor, code, minorUnit), unresolved: false };
   }
 
-  const exponent = CURRENCY_MINOR_UNITS[code];
-  if (exponent === undefined) {
-    return { ...base, format: 'major', reason: `no known minor unit for ${code}; provide currency_minor_unit` };
+  if (scale === undefined) {
+    return { ...base, reason: 'money scale is ambiguous; provide a minor unit or an endpoint scale' };
   }
-  const minor = Math.round(numeric * 10 ** exponent);
-  return {
-    ...base,
-    format: 'major',
-    minor,
-    display: formatMinor(minor, code),
-    unresolved: false,
-  };
+  if (scale === 'major') {
+    const exponent = CURRENCY_MINOR_UNITS[code];
+    if (exponent === undefined) {
+      return { ...base, format: 'major', reason: `no known minor unit for ${code}; provide currency_minor_unit` };
+    }
+    const minor = Math.round(numeric * 10 ** exponent);
+    return { ...base, format: 'major', minor, display: formatMinor(minor, code, exponent), unresolved: false };
+  }
+  return { ...base, reason: `unknown money scale: ${scale}` };
 }
 
 function moneyFromObserved(raw, source) {
   if (source === 'cart') {
     const prices = raw?.prices ?? {};
-    return normalizeMoney({ amount: prices.price, currency: prices.currency_code, minorUnit: prices.currency_minor_unit });
+    return normalizeMoney({
+      amount: prices.price,
+      currency: prices.currency_code,
+      minorUnit: prices.currency_minor_unit,
+      scale: 'minor',
+    });
   }
   const min = raw?.priceRange?.minVariantPrice ?? null;
-  if (!min) return normalizeMoney({});
-  return normalizeMoney({ amount: min.amount, currency: min.currencyCode });
+  if (!min) return normalizeMoney({ scale: 'major' });
+  return normalizeMoney({ amount: min.amount, currency: min.currencyCode, scale: 'major' });
 }
 
 /**
@@ -163,11 +172,22 @@ export function mergeObservedEvidence(observations) {
   const unresolved = new Set();
   for (const observation of observations) for (const note of observation.unresolved) unresolved.add(note);
 
+  // Material identity must agree across observations; a same id is not proof
+  // that two reads describe the same product (ADR-0007).
+  const titles = new Set(observations.map((o) => o.title).filter(Boolean));
+  if (titles.size > 1) conflicts.push(`conflicting title evidence: ${[...titles].join(' vs ')}`);
+  const skus = new Set(observations.map((o) => o.sku).filter(Boolean));
+  if (skus.size > 1) conflicts.push(`conflicting sku evidence: ${[...skus].join(' vs ')}`);
+  const types = new Set(observations.map((o) => o.type).filter(Boolean));
+  if (types.size > 1) conflicts.push(`conflicting type evidence: ${[...types].join(' vs ')}`);
+
   const priced = observations.filter((o) => !o.money.unresolved);
   let money = priced[0]?.money ?? observations[0].money;
-  const distinctMinor = new Set(priced.map((o) => o.money.minor));
-  if (distinctMinor.size > 1) {
-    conflicts.push(`conflicting price evidence: ${[...distinctMinor].join(' vs ')}`);
+  // Compare the complete monetary representation, not just the numeric amount:
+  // PHP 46900 and USD 46900 are not the same price.
+  const distinctMoney = new Set(priced.map((o) => `${o.money.currency ?? '?'}:${o.money.minor}`));
+  if (distinctMoney.size > 1) {
+    conflicts.push(`conflicting price evidence: ${[...distinctMoney].join(' vs ')}`);
     money = { ...money, unresolved: true, reason: 'conflicting price evidence' };
   }
 

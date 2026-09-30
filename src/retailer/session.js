@@ -18,53 +18,20 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { normalizeObservedProduct } from './normalize.js';
+import {
+  RETAILER_ORIGIN,
+  classifyReadRequest,
+  classifyReadResponse,
+  applyReadOnlyRoute,
+} from './read-only-guard.js';
+
+export { RETAILER_ORIGIN, classifyReadRequest, classifyReadResponse, applyReadOnlyRoute };
 
 export class SessionError extends Error {
   constructor(code, message) {
     super(message);
     this.code = code;
   }
-}
-
-export const RETAILER_ORIGIN = 'https://www.landmark.ph';
-
-/**
- * Read-only gate for the dedicated session. Mirrors the probe's boundary:
- * only same-origin GET/HEAD reaches the retailer, redirects are never followed,
- * and checkout/logout navigation is blocked. It is a safety net, not a licence
- * to mutate.
- */
-export function classifyReadRequest({ method, url, retailerOrigin = RETAILER_ORIGIN, isNavigation = false, resourceType = 'other' }) {
-  let parsed;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return { action: 'abort', reason: 'unparseable-url' };
-  }
-  const isRead = method === 'GET' || method === 'HEAD';
-  if (parsed.origin !== retailerOrigin) {
-    const renderable = new Set(['script', 'stylesheet', 'image', 'font', 'media']);
-    if (isRead && renderable.has(resourceType)) return { action: 'allow' };
-    return { action: 'abort', reason: 'cross-origin' };
-  }
-  if (!isRead) return { action: 'abort', reason: `non-read-method:${method}` };
-  if (isNavigation && /^\/(checkout|logout|my-account\/orders)/i.test(parsed.pathname)) {
-    return { action: 'abort', reason: 'blocked-navigation' };
-  }
-  return { action: 'allow' };
-}
-
-const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
-
-export function classifyReadResponse({ status, location = null, baseUrl }) {
-  if (!REDIRECT_STATUS.has(status)) return { action: 'fulfill' };
-  let destination = null;
-  try {
-    destination = location ? new URL(location, baseUrl).href : null;
-  } catch {
-    destination = null;
-  }
-  return { action: 'abort', reason: 'redirect-not-followed', destination };
 }
 
 /** Journal-safe cart lines: no line key, no raw session or header values. */
@@ -119,6 +86,9 @@ export function createRetailerSession({ dataDir, driver, expectedContext = { acc
   }
 
   async function verifyContext() {
+    // Any re-check revokes authority until it succeeds again, so a failed
+    // session check can never leave a previous `verified` in force.
+    verified = false;
     try {
       await ensureOpen();
     } catch (err) {
@@ -132,6 +102,8 @@ export function createRetailerSession({ dataDir, driver, expectedContext = { acc
     }
     const context = { account: info?.account ?? null, branch: info?.branch ?? null };
     const problems = [...(info?.problems ?? [])];
+    if (!expectedContext.account) problems.push('no intended account is configured; refusing to verify');
+    if (!expectedContext.branch) problems.push('no intended branch is configured; refusing to verify');
     if (info?.expired) {
       verified = false;
       lastContext = context;
@@ -176,15 +148,24 @@ export function createRetailerSession({ dataDir, driver, expectedContext = { acc
     }
     try {
       const result = await driver.readCart();
+      const ctx = result?.context ?? null;
+      const problems = [...(result?.problems ?? [])];
+      if (!ctx || ctx.account !== lastContext?.account || ctx.branch !== lastContext?.branch) {
+        problems.push('the cart read did not confirm the verified shopping context');
+      }
+      if (problems.length) {
+        verified = false;
+        return { ok: false, lines: [], context: ctx ?? lastContext, observedAt: new Date().toISOString(), problems };
+      }
       const lines = Array.isArray(result?.lines) ? result.lines : [];
       lastCart = {
         ok: true,
         lines: redactCartLines(lines),
-        context: result?.context ?? lastContext,
+        context: ctx,
         observedAt: new Date().toISOString(),
         note: lines.length ? null : 'the cart read succeeded but returned no lines',
       };
-      return { ...lastCart, problems: result?.problems ?? [] };
+      return { ...lastCart, problems: [] };
     } catch (err) {
       verified = false;
       return {
@@ -249,37 +230,7 @@ export function createPlaywrightDriver({ retailerOrigin = RETAILER_ORIGIN, chann
       serviceWorkers: 'block',
     });
     page = context.pages()[0] ?? (await context.newPage());
-    await context.route('**/*', async (route) => {
-      const request = route.request();
-      const decision = classifyReadRequest({
-        method: request.method(),
-        url: request.url(),
-        retailerOrigin,
-        isNavigation: request.isNavigationRequest(),
-        resourceType: request.resourceType(),
-      });
-      if (decision.action === 'abort') return route.abort('blockedbyclient');
-      let origin = null;
-      try {
-        origin = new URL(request.url()).origin;
-      } catch {
-        /* classifyReadRequest already rejected unparseable URLs */
-      }
-      if (origin !== retailerOrigin) return route.continue();
-      let response;
-      try {
-        response = await route.fetch({ maxRedirects: 0 });
-      } catch {
-        return route.abort('blockedbyclient');
-      }
-      const disposition = classifyReadResponse({
-        status: response.status(),
-        location: response.headers()['location'],
-        baseUrl: request.url(),
-      });
-      if (disposition.action === 'abort') return route.abort('blockedbyclient');
-      return route.fulfill({ response });
-    });
+    await context.route('**/*', (route) => applyReadOnlyRoute(route, { retailerOrigin }));
   }
 
   async function sessionInfo() {

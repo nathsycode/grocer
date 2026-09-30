@@ -4,7 +4,7 @@
 
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { CATALOG, productById, formatMoney, parseSize } from './catalog.js';
+import { CATALOG, productById, formatMoney, parseSize, sizeEquals } from './catalog.js';
 import {
   interpretRequest,
   discoverCandidates,
@@ -12,6 +12,7 @@ import {
   executableActions,
   revalidateApproval,
   verifyCart,
+  norm,
 } from './domain.js';
 import { Journal, JournalError, ExecutionLock, isProcessAlive } from './journal.js';
 import { Simulator, SimTimeoutError } from './simulator.js';
@@ -517,7 +518,10 @@ export class Store {
     this.assertPlanningAllowed();
     const run = this.requireRun(runId);
     if (!Array.isArray(items) || items.length === 0) throw new StoreError('invalid', 'items are required');
-    const normalized = items.map((raw) => normalizeCorrection(raw, this.catalog));
+    const normalized = items.map((raw, index) => {
+      const previous = run.items.find((i) => i.id === raw?.id) ?? run.items[index] ?? null;
+      return normalizeCorrection(raw, this.catalog, previous);
+    });
     const candidates = Object.fromEntries(normalized.map((i) => [i.id, discoverCandidates(i, this.catalog)]));
     const revision = run.revision + 1;
     if (run.approval) this.#append('approval_invalidated', { runId, reason: 'request corrected after approval' });
@@ -852,7 +856,7 @@ function summarizeRecord(type, rest) {
   }
 }
 
-function normalizeCorrection(raw, catalog) {
+function normalizeCorrection(raw, catalog, previous = null) {
   if (!raw || typeof raw !== 'object') throw new StoreError('invalid', 'each item must be an object');
   const prod = raw.productId ? productById(raw.productId, catalog) : null;
 
@@ -881,7 +885,7 @@ function normalizeCorrection(raw, catalog) {
   const name = String(raw.name ?? '').trim();
   if (!name) throw new StoreError('invalid', 'item name is required');
 
-  return {
+  const item = {
     id: raw.id ?? `item-${crypto.randomUUID().slice(0, 8)}`,
     raw: raw.raw ?? '',
     name,
@@ -891,6 +895,33 @@ function normalizeCorrection(raw, catalog) {
     quantity: Number.parseInt(quantityText, 10),
     restrictions: { noSubstitution: Boolean(raw.restrictions?.noSubstitution ?? raw.noSubstitution) },
   };
+
+  // A correction is user-authored: a changed constraint becomes explicit and
+  // drops any stale model metadata. An unchanged item keeps its interpretation
+  // provenance (assumptions, unresolved facts, inferred attributes) so editing
+  // one line cannot silently strip the qualification from another.
+  if (previous && sameConstraints(previous, item)) {
+    return {
+      ...item,
+      lineIndex: previous.lineIndex,
+      assumptions: previous.assumptions ?? [],
+      unresolved: previous.unresolved ?? [],
+      inferred: previous.inferred ?? {},
+      queries: previous.queries ?? [],
+    };
+  }
+  return { ...item, lineIndex: previous?.lineIndex, inferred: {}, assumptions: [], unresolved: [] };
+}
+
+function sameConstraints(a, b) {
+  return (
+    norm(a.name) === norm(b.name) &&
+    norm(a.brand) === norm(b.brand) &&
+    norm(a.variant) === norm(b.variant) &&
+    sizeEquals(a.size, b.size) &&
+    a.quantity === b.quantity &&
+    Boolean(a.restrictions?.noSubstitution) === Boolean(b.restrictions?.noSubstitution)
+  );
 }
 
 function optionalText(value) {

@@ -40,12 +40,41 @@ test('normalizeMoney reads a minor-unit cart representation without rescaling', 
 test('normalizeMoney reads a major-unit catalogue representation and scales explicitly', () => {
   // Observed search/detail: amount 87.5 or "87.5", currencyCode "Php".
   for (const amount of [87.5, '87.5']) {
-    const money = normalizeMoney({ amount, currency: 'Php' });
+    const money = normalizeMoney({ amount, currency: 'Php', scale: 'major' });
     assert.equal(money.minor, 8750);
     assert.equal(money.display, 'PHP 87.50');
     assert.equal(money.format, 'major');
     assert.equal(money.unresolved, false);
   }
+});
+
+test('normalizeMoney refuses to guess a scale when the endpoint does not state one', () => {
+  // A bare "46900" could be 469.00 or 46,900.00 depending on the route.
+  const money = normalizeMoney({ amount: '46900', currency: 'PHP' });
+  assert.equal(money.minor, null);
+  assert.equal(money.unresolved, true);
+  assert.match(money.reason, /minor unit|scale/i);
+});
+
+test('normalizeMoney rejects an empty amount rather than resolving it to zero', () => {
+  const money = normalizeMoney({ amount: '', currency: 'PHP', scale: 'major' });
+  assert.equal(money.minor, null);
+  assert.equal(money.unresolved, true);
+});
+
+test('normalizeMoney displays with the supplied exponent, not a currency default', () => {
+  const money = normalizeMoney({ amount: '12345', currency: 'PHP', minorUnit: 3 });
+  assert.equal(money.minor, 12345);
+  assert.equal(money.display, 'PHP 12.345');
+});
+
+test('a cart price missing its minor unit stays unresolved instead of guessing', () => {
+  const line = normalizeObservedProduct(
+    { id: 39943, key: 'k', type: 'simple', quantity: 1, prices: { price: '46900', currency_code: 'PHP' } },
+    { source: 'cart' },
+  );
+  assert.equal(line.money.minor, null);
+  assert.ok(line.unresolved.some((u) => /price/i.test(u)));
 });
 
 test('normalizeMoney keeps currency and flags an unknown currency without a minor unit', () => {
@@ -160,4 +189,31 @@ test('mergeObservedEvidence refuses to merge two different product ids', () => {
   const a = normalizeObservedProduct({ id: '27213', sku: 'A', type: 'simple' }, { source: 'search' });
   const b = normalizeObservedProduct({ id: 27185, sku: 'B', type: 'simple' }, { source: 'search' });
   assert.throws(() => mergeObservedEvidence([a, b]), /same product/i);
+});
+
+test('mergeObservedEvidence surfaces identity conflicts, not just money', () => {
+  const a = normalizeObservedProduct(
+    { id: '27213', title: 'Highlands Gold Corned Beef 150g', sku: 'MKT-14069', type: 'simple', priceRange: { minVariantPrice: { amount: 87.5, currencyCode: 'Php' } } },
+    { source: 'search' },
+  );
+  const b = normalizeObservedProduct(
+    { id: 27213, title: 'Highlands Gold Corned Beef 260g', sku: 'MKT-99999', type: 'simple', priceRange: { minVariantPrice: { amount: '87.5', currencyCode: 'Php' } } },
+    { source: 'detail' },
+  );
+  const merged = mergeObservedEvidence([a, b]);
+  assert.ok(merged.conflicts.some((c) => /title/i.test(c)));
+  assert.ok(merged.conflicts.some((c) => /sku/i.test(c)));
+});
+
+test('mergeObservedEvidence surfaces a currency conflict even when minor amounts match', () => {
+  const a = normalizeObservedProduct(
+    { id: '27213', title: 'x', sku: 'S', type: 'simple', priceRange: { minVariantPrice: { amount: 87.5, currencyCode: 'Php' } } },
+    { source: 'search' },
+  );
+  const b = normalizeObservedProduct(
+    { id: '27213', title: 'x', sku: 'S', type: 'simple', priceRange: { minVariantPrice: { amount: 87.5, currencyCode: 'USD' } } },
+    { source: 'detail' },
+  );
+  const merged = mergeObservedEvidence([a, b]);
+  assert.ok(merged.conflicts.some((c) => /price|currency/i.test(c)));
 });

@@ -240,3 +240,62 @@ test('validateProposal marks a model-inferred brand and size as visible assumpti
   assert.ok(result.items[0].assumptions.some((a) => /brand/i.test(a)));
   assert.ok(result.items[0].assumptions.some((a) => /size/i.test(a)));
 });
+
+// --- Review fixes: inferred attributes must not satisfy the gate ------------
+
+test('a model-inferred brand and size are marked inferred, not explicit', () => {
+  const raw = wellFormed({
+    items: [{ ...wellFormed().items[0], raw: 'Full cream milk', name: 'Full Cream Milk', brand: 'Arla', sizeText: '1 L', quantity: 1 }],
+  });
+  const result = validateProposal(raw, { requestText: 'Full cream milk' });
+  assert.equal(result.items[0].brand, 'Arla');
+  assert.equal(result.items[0].inferred.brand, true);
+  assert.equal(result.items[0].inferred.size, true);
+});
+
+test('an explicit brand that is absent from the catalogue still counts as explicit', () => {
+  const raw = wellFormed({
+    items: [
+      {
+        ...wellFormed().items[0],
+        raw: 'Anchor Full Cream Milk 1L only, no substitutions',
+        name: 'Full Cream Milk',
+        brand: 'Anchor',
+        sizeText: '1 L',
+        noSubstitution: true,
+        quantity: 1,
+      },
+    ],
+  });
+  const result = validateProposal(raw, { requestText: 'Anchor Full Cream Milk 1L only, no substitutions' });
+  assert.equal(result.items[0].brand, 'Anchor');
+  assert.equal(result.items[0].inferred.brand, false, 'a brand named in the text is an explicit constraint');
+  assert.equal(result.items[0].restrictions.noSubstitution, true);
+});
+
+test('an explicit quantity in the middle of a line is detected and protected', () => {
+  const raw = wellFormed({
+    items: [{ ...wellFormed().items[0], raw: 'Highlands Corned Beef 150g x2 — no substitutions', quantity: 99, noSubstitution: true }],
+  });
+  const result = validateProposal(raw, { requestText: 'Highlands Corned Beef 150g x2 — no substitutions' });
+  assert.equal(result.items[0].quantity, 2);
+  assert.ok(result.problems.some((p) => /quantity/i.test(p)));
+});
+
+test('the model timeout stays active while the response body is read', async () => {
+  const proposer = openAiCompatibleProposer({
+    baseUrl: 'https://model.example/v1',
+    apiKey: 'k',
+    model: 'm',
+    timeoutMs: 20,
+    fetchImpl: async (url, options) => ({
+      ok: true,
+      status: 200,
+      json: () =>
+        new Promise((_, reject) => {
+          options.signal.addEventListener('abort', () => reject(new Error('aborted')));
+        }),
+    }),
+  });
+  await assert.rejects(() => proposer.interpret({ requestText: 'milk' }), ProposerError);
+});

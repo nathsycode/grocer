@@ -43,6 +43,33 @@ function optionalText(value) {
   return trimmed ? trimmed.slice(0, MAX_TEXT) : null;
 }
 
+/** True when a value (or its first word) literally appears in the source line. */
+function textMentions(line, value) {
+  const text = ` ${norm(line)} `;
+  const full = norm(value);
+  if (full && text.includes(` ${full} `)) return true;
+  const first = full.split(' ')[0];
+  return Boolean(first) && text.includes(` ${first} `);
+}
+
+/**
+ * Resolve one attribute the model proposed. A stated value in the source text
+ * is an explicit user constraint and may not be changed by the model; an
+ * omitted attribute the model supplies is an inference and is marked as such.
+ */
+function resolveAttribute({ proposed, baseline, line, label, lineIndex, problems, assumptions }) {
+  if (baseline) {
+    if (norm(proposed) !== norm(baseline)) {
+      problems.push(`model changed an explicit ${label} on line ${lineIndex + 1}; kept ${baseline}`);
+    }
+    return { value: baseline, explicit: true };
+  }
+  if (!proposed) return { value: null, explicit: false };
+  const explicit = textMentions(line, proposed);
+  if (!explicit) assumptions.push(`${label[0].toUpperCase()}${label.slice(1)} ${proposed} was inferred by the model; the text does not state it.`);
+  return { value: proposed, explicit };
+}
+
 function candidateIds(candidatesByLine) {
   const map = new Map();
   for (const [key, list] of Object.entries(candidatesByLine ?? {})) {
@@ -103,6 +130,7 @@ export function validateProposal(raw, { requestText = '', candidatesByLine } = {
         sizeText: baseline.size ? baseline.size.display : null,
         assumptions,
         unresolved,
+        inferred: {},
         queries: [],
       });
       continue;
@@ -112,32 +140,40 @@ export function validateProposal(raw, { requestText = '', candidatesByLine } = {
 
     // An explicit brand, variant, or size in the source text is a user
     // instruction, not a model suggestion. The model may infer an omitted
-    // attribute (shown as an assumption) but may never change a stated one
-    // (ADR-0007: never silently broaden brand, variant, quantity, or size).
-    let brand = optionalText(proposed.brand);
-    if (baseline.brand && norm(brand) !== norm(baseline.brand)) {
-      problems.push(`model changed an explicit brand on line ${lineIndex + 1}; kept ${baseline.brand}`);
-      brand = baseline.brand;
-    } else if (!baseline.brand && brand) {
-      assumptions.push(`Brand ${brand} was inferred by the model; the text does not state it.`);
-    }
+    // attribute (shown as an assumption and marked inferred) but may never
+    // change a stated one (ADR-0007).
+    const brandAttr = resolveAttribute({
+      proposed: optionalText(proposed.brand),
+      baseline: baseline.brand,
+      line: rawLine,
+      label: 'brand',
+      lineIndex,
+      problems,
+      assumptions,
+    });
+    const brand = brandAttr.value;
 
-    let variant = optionalText(proposed.variant);
-    if (baseline.variant && norm(variant) !== norm(baseline.variant)) {
-      problems.push(`model changed an explicit variant on line ${lineIndex + 1}; kept ${baseline.variant}`);
-      variant = baseline.variant;
-    } else if (!baseline.variant && variant) {
-      assumptions.push(`Variant ${variant} was inferred by the model; the text does not state it.`);
-    }
+    const variantAttr = resolveAttribute({
+      proposed: optionalText(proposed.variant),
+      baseline: baseline.variant,
+      line: rawLine,
+      label: 'variant',
+      lineIndex,
+      problems,
+      assumptions,
+    });
+    const variant = variantAttr.value;
 
     let sizeText = optionalText(proposed.sizeText);
     let size = sizeText ? parseSize(sizeText) : null;
-    if (baseline.size && !sizeEquals(size, baseline.size)) {
-      problems.push(`model changed an explicit size on line ${lineIndex + 1}; kept ${baseline.size.display}`);
+    let sizeExplicit = false;
+    if (baseline.size) {
+      if (!sizeEquals(size, baseline.size)) {
+        problems.push(`model changed an explicit size on line ${lineIndex + 1}; kept ${baseline.size.display}`);
+      }
       size = baseline.size;
       sizeText = baseline.size.display;
-    } else if (baseline.size) {
-      sizeText = baseline.size.display;
+      sizeExplicit = true;
     } else if (size) {
       assumptions.push(`Size ${sizeText} was inferred by the model; the text does not state it.`);
     } else if (sizeText) {
@@ -178,6 +214,12 @@ export function validateProposal(raw, { requestText = '', candidatesByLine } = {
       restrictions: { noSubstitution },
       assumptions,
       unresolved,
+      inferred: {
+        brand: Boolean(brand) && !brandAttr.explicit,
+        variant: Boolean(variant) && !variantAttr.explicit,
+        size: Boolean(size) && !sizeExplicit,
+        quantity: explicit === null && quantity !== 1,
+      },
       queries: textArray(proposed.queries, MAX_QUERIES),
     });
   }
@@ -321,25 +363,27 @@ export function openAiCompatibleProposer({ baseUrl, apiKey, model, fetchImpl, ma
     calls += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let res;
+    let payload;
     try {
-      res = await doFetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
+      const res = await doFetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
         signal: controller.signal,
         body: JSON.stringify({ model, temperature: 0, response_format: { type: 'json_object' }, messages }),
       });
+      if (!res.ok) throw new ProposerError('http', `model provider returned HTTP ${res.status}`);
+      try {
+        // The timeout must stay armed through the body read: a slow body is
+        // just as much a failure as a slow connection.
+        payload = await res.json();
+      } catch {
+        throw new ProposerError('malformed', 'model provider returned a non-JSON response');
+      }
     } catch (err) {
+      if (err instanceof ProposerError) throw err;
       throw new ProposerError('network', `model request failed: ${err.message}`);
     } finally {
       clearTimeout(timer);
-    }
-    if (!res.ok) throw new ProposerError('http', `model provider returned HTTP ${res.status}`);
-    let payload;
-    try {
-      payload = await res.json();
-    } catch {
-      throw new ProposerError('malformed', 'model provider returned a non-JSON response');
     }
     const content = payload?.choices?.[0]?.message?.content;
     if (typeof content !== 'string') throw new ProposerError('malformed', 'model response had no message content');

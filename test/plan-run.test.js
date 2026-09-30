@@ -163,3 +163,63 @@ test('the HTTP /api/run route uses the proposal pipeline', async () => {
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+// --- Review fixes: unresolved and inferred items cannot become executable ---
+
+test('a line the model omits stays unresolved and cannot be preselected or selected', async () => {
+  const proposer = {
+    provider: 'stub',
+    configured: true,
+    async interpret() {
+      return { items: [] };
+    },
+    async rank() {
+      return { rankings: [] };
+    },
+  };
+  const store = storeWith(proposer);
+  const run = await store.planRun(REQUEST);
+  assert.ok(run.items[0].unresolved.length > 0);
+  assert.equal(run.selections['item-1'], undefined, 'an unresolved item must not be preselected');
+  const candidate = run.candidates['item-1'].find((c) => c.product.id === 'hl-beef-150g');
+  assert.equal(candidate.selectable, false);
+  assert.throws(
+    () => store.setSelections(run.runId, { 'item-1': { productId: 'hl-beef-150g' } }),
+    (err) => err.code === 'invalid-selection',
+  );
+});
+
+test('a model-inferred preference is not preselected and does not make a green plan', async () => {
+  const proposer = {
+    provider: 'stub',
+    configured: true,
+    async interpret() {
+      return {
+        items: [
+          {
+            lineIndex: 0,
+            raw: 'Full cream milk',
+            name: 'Full Cream Milk',
+            brand: 'Arla',
+            variant: null,
+            sizeText: '1 L',
+            quantity: 1,
+            noSubstitution: false,
+            assumptions: [],
+            unresolved: [],
+            queries: [],
+          },
+        ],
+      };
+    },
+    async rank() {
+      return { rankings: [] };
+    },
+  };
+  const store = storeWith(proposer);
+  const run = await store.planRun('Full cream milk');
+  assert.equal(run.items[0].inferred.brand, true);
+  assert.equal(run.selections['item-1'], undefined, 'an inferred preference must start unselected');
+  const arla = run.candidates['item-1'].find((c) => c.product.id === 'arla-milk-1l');
+  assert.equal(arla.color, 'yellow');
+});

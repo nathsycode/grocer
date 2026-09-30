@@ -27,8 +27,16 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import readline from 'node:readline/promises';
 import { pathToFileURL } from 'node:url';
+import {
+  RETAILER_ORIGIN as SHARED_RETAILER_ORIGIN,
+  classifyReadRequest,
+  classifyReadResponse,
+} from '../src/retailer/read-only-guard.js';
 
-export const RETAILER_ORIGIN = 'https://www.landmark.ph';
+// The read-only request/response gate is shared with the application session so
+// a security fix lands once. The probe keeps its own evidence-recording route
+// handler and redaction; only the decision logic is shared.
+export const RETAILER_ORIGIN = SHARED_RETAILER_ORIGIN;
 export const HOME_URL = `${RETAILER_ORIGIN}/`;
 
 const DEFAULT_PROFILE_DIR = '.local/landmark-probe/profile';
@@ -38,8 +46,6 @@ const MAX_ARRAY = 50;
 const MAX_DEPTH = 8;
 const MAX_STRING = 500;
 const MAX_PATH_SEGMENT = 48;
-
-const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 
 // Fields that identify a person. Collapsed entirely; never digests, because a
 // digest of an email or phone number is still a linkable identifier.
@@ -106,9 +112,6 @@ const CONTEXT_PARAMS = new Set([
 
 // Cross-origin resource types needed for the page to render. Everything else
 // cross-origin is blocked so the probe does not send data to third parties.
-const RENDER_TYPES = new Set(['script', 'stylesheet', 'image', 'font', 'media']);
-
-const BLOCKED_NAV = /^\/(checkout|logout|my-account\/orders)/i;
 
 function digest(value) {
   return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 12);
@@ -190,33 +193,11 @@ export function redactUrl(rawUrl) {
 }
 
 /**
- * Read-only gate. `allow` is the only action that reaches the retailer; every
- * other decision is recorded as evidence rather than silently dropped.
+ * Read-only request gate, shared with the application session. `allow` is the
+ * only action that reaches the retailer; every other decision is recorded as
+ * evidence rather than silently dropped.
  */
-export function classifyRequest({
-  method,
-  url,
-  retailerOrigin = RETAILER_ORIGIN,
-  isNavigation = false,
-  resourceType = 'other',
-}) {
-  let parsed;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return { action: 'abort', reason: 'unparseable-url' };
-  }
-  const isRead = method === 'GET' || method === 'HEAD';
-  if (parsed.origin !== retailerOrigin) {
-    if (isRead && RENDER_TYPES.has(resourceType)) return { action: 'allow' };
-    return { action: 'abort', reason: 'cross-origin' };
-  }
-  if (!isRead) return { action: 'abort', reason: `non-read-method:${method}` };
-  if (isNavigation && BLOCKED_NAV.test(parsed.pathname)) {
-    return { action: 'abort', reason: 'blocked-navigation' };
-  }
-  return { action: 'allow' };
-}
+export const classifyRequest = classifyReadRequest;
 
 /**
  * Cart-line view that keeps product identity and cart-line keys distinct. Every
@@ -258,28 +239,12 @@ export function dedupeObservations(observations) {
   return [...seen.values()];
 }
 
-function resolveLocation(location, base) {
-  if (!location) return null;
-  try {
-    return new URL(location, base).href;
-  } catch {
-    return null;
-  }
-}
-
 /**
- * Decide what to do with a fetched response. Redirects are never followed:
- * Playwright does not re-route a redirect target, so following one would
- * contact a URL the request gate never classified.
+ * Response gate, shared with the application session. Redirects are never
+ * followed: Playwright does not re-route a redirect target, so following one
+ * would contact a URL the request gate never classified.
  */
-export function classifyResponse({ status, location = null, baseUrl }) {
-  if (!REDIRECT_STATUS.has(status)) return { action: 'fulfill' };
-  return {
-    action: 'abort',
-    reason: 'redirect-not-followed',
-    destination: resolveLocation(location, baseUrl),
-  };
-}
+export const classifyResponse = classifyReadResponse;
 
 export function parseArgs(argv) {
   const opts = {

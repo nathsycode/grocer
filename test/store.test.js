@@ -547,3 +547,37 @@ test('a restart with surviving ownership invalidates the previous approval', () 
   assert.equal(restarted.snapshot().blocked.kind, 'ownership');
   assert.throws(() => restarted.startExecution(run.runId), (err) => err.code === 'owned' || err.code === 'blocked');
 });
+
+// --- Review fix: corrections must not erase interpretation provenance ------
+
+test('correcting one item preserves interpretation metadata on unchanged items', async () => {
+  const proposer = {
+    provider: 'stub',
+    configured: true,
+    async interpret() {
+      return {
+        items: [
+          { lineIndex: 0, raw: 'Highlands Corned Beef 150g x2', name: 'Corned Beef', brand: 'Highlands', variant: null, sizeText: '150 g', quantity: 2, noSubstitution: false, assumptions: ['Brand assumed from context.'], unresolved: [], queries: [] },
+          { lineIndex: 1, raw: 'Pasta Roma Fusilli 500g x2', name: 'Fusilli', brand: 'Pasta Roma', variant: null, sizeText: '500 g', quantity: 2, noSubstitution: false, assumptions: [], unresolved: [], queries: [] },
+        ],
+      };
+    },
+    async rank() {
+      return { rankings: [] };
+    },
+  };
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'grocer-corrections-'));
+  const store = createStore({ dataDir, stepDelayMs: 0, proposer });
+  store.load();
+  store.simulator.seedCart(DEMO_CART);
+
+  const run = await store.planRun('Highlands Corned Beef 150g x2\nPasta Roma Fusilli 500g x2');
+  assert.deepEqual(run.items[0].assumptions, ['Brand assumed from context.']);
+
+  const corrected = store.correctRequest(run.runId, [
+    { id: 'item-1', raw: 'Highlands Corned Beef 150g x2', name: 'Corned Beef', brand: 'Highlands', sizeText: '150 g', quantity: 2 },
+    { id: 'item-2', raw: 'Pasta Roma Fusilli 500g x2', name: 'Fusilli', brand: 'Pasta Roma', sizeText: '500 g', quantity: 3 },
+  ]);
+  assert.deepEqual(corrected.items[0].assumptions, ['Brand assumed from context.'], 'an unchanged item keeps its assumptions');
+  assert.deepEqual(corrected.items[1].assumptions, [], 'a changed item drops stale metadata');
+});

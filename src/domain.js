@@ -69,7 +69,10 @@ export function interpretLine(line, index, catalog = CATALOG) {
   };
 }
 
-const QUANTITY_RE = /(?:^|\s)x\s*(\d+)\s*$|(?:^|\s)(\d+)\s*x\s*$/i;
+// A quantity token may appear anywhere in the line (for example before a
+// trailing restriction), not only at the end. `x2`, `2 x`, and `2 x 250g` all
+// read as a target quantity of 2; a bare size such as `150g` does not.
+const QUANTITY_RE = /(?:^|\s)x\s*(\d+)(?=\s|$)|(?:^|\s)(\d+)\s*x(?=\s|$)/i;
 
 function extractQuantity(line) {
   const m = String(line).match(QUANTITY_RE);
@@ -111,6 +114,16 @@ export function classify(item, prod, modelRanking = null) {
   const modelRank = Number.isInteger(modelRanking?.rank) ? modelRanking.rank : null;
   const modelRationale = typeof modelRanking?.rationale === 'string' ? modelRanking.rationale : null;
   const ranked = (result) => ({ ...result, modelRank, modelRationale });
+  // Unresolved interpretation is not decoration: it cannot become a selectable
+  // or executable choice merely because a candidate looks plausible (ADR-0007).
+  if (item.unresolved?.length) {
+    return ranked({
+      product: productView(prod),
+      color: 'red',
+      selectable: false,
+      reason: `Unresolved interpretation: ${item.unresolved.join(' ')}`,
+    });
+  }
   if (prod.evidenceConflict) {
     return ranked({
       product: productView(prod),
@@ -119,9 +132,11 @@ export function classify(item, prod, modelRanking = null) {
       reason: prod.evidenceNote ?? 'Conflicting product evidence; non-selectable.',
     });
   }
-  const brandSpecified = Boolean(item.brand);
-  const sizeSpecified = Boolean(item.size);
-  const variantSpecified = Boolean(item.variant);
+  // A model-inferred brand, variant, or size is a preference assumption, not
+  // an explicit requirement, so it must not satisfy the gate (ADR-0002/0007).
+  const brandSpecified = Boolean(item.brand) && !item.inferred?.brand;
+  const sizeSpecified = Boolean(item.size) && !item.inferred?.size;
+  const variantSpecified = Boolean(item.variant) && !item.inferred?.variant;
   const brandOk = !brandSpecified || sameText(item.brand, prod.brand);
   const sizeOk = !sizeSpecified || sizeEquals(item.size, prod.size);
   const variantOk = !variantSpecified || sameText(item.variant, prod.variant);

@@ -226,3 +226,47 @@ test('the reviewed plan carries material assumptions and unresolved interpretati
   assert.deepEqual(plan.actions[0].assumptions, withReview.assumptions);
   assert.deepEqual(plan.actions[0].unresolved, withReview.unresolved);
 });
+
+// --- Review fixes: inferred attributes and unresolved items -----------------
+
+test('an inferred brand and size do not satisfy the gate and stay yellow', () => {
+  const [parsed] = interpretRequest('Full cream milk');
+  const inferred = { ...parsed, brand: 'Arla', size: parseSize('1 L'), inferred: { brand: true, size: true } };
+  const candidate = discoverCandidates(inferred, CATALOG, {}).find((c) => c.product.id === 'arla-milk-1l');
+  assert.equal(candidate.color, 'yellow');
+  assert.equal(candidate.selectable, true);
+});
+
+test('an inferred attribute is shown but does not make a mismatched brand green', () => {
+  const [parsed] = interpretRequest('Full cream milk');
+  const inferred = { ...parsed, brand: 'Arla', inferred: { brand: true } };
+  const candidate = discoverCandidates(inferred, CATALOG, {}).find((c) => c.product.id === 'arla-milk-1l');
+  assert.notEqual(candidate.color, 'green');
+});
+
+test('an unresolved item is non-selectable regardless of how good the candidate looks', () => {
+  const unresolved = item({ unresolved: ['Model returned no interpretation for this line.'] });
+  const candidate = discoverCandidates(unresolved, CATALOG, {}).find((c) => c.product.id === 'hl-beef-150g');
+  assert.equal(candidate.color, 'red');
+  assert.equal(candidate.selectable, false);
+});
+
+test('an explicit unsupported brand with a no-substitution restriction blocks other brands', () => {
+  const restricted = item({
+    raw: 'Anchor Full Cream Milk 1L only, no substitutions',
+    name: 'Full Cream Milk',
+    brand: 'Anchor',
+    size: parseSize('1L'),
+    restrictions: { noSubstitution: true },
+    inferred: { brand: false },
+  });
+  const candidate = discoverCandidates(restricted, CATALOG, {}).find((c) => c.product.id === 'arla-milk-1l');
+  assert.equal(candidate.color, 'red');
+  assert.equal(candidate.selectable, false);
+});
+
+test('a quantity token in the middle of a line is still the target', () => {
+  const [parsed] = interpretRequest('Highlands Corned Beef 150g x2 — no substitutions');
+  assert.equal(parsed.quantity, 2);
+  assert.equal(parsed.restrictions.noSubstitution, true);
+});

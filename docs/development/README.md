@@ -47,7 +47,8 @@ Playwright is optional and `--no-save`; the rehearsal and tests run without it. 
 | `src/domain.js` | deterministic interpretation, matching gates, plan, verification |
 | `src/proposer.js` | proposal-only model boundary and independent validation |
 | `src/retailer/normalize.js` | endpoint-aware product identity and money normalization |
-| `src/retailer/session.js` | dedicated retailer session, read-only guard, verified-context gate |
+| `src/retailer/read-only-guard.js` | shared request/redirect guard for the session and the ticket 02 probe |
+| `src/retailer/session.js` | dedicated retailer session, verified-context gate, Playwright driver |
 | `src/journal.js` | append-only durable safety journal and exclusive execution lock |
 | `src/simulator.js` | local simulated retailer cart with idempotency-keyed operations |
 | `src/store.js` | orchestration, run state, one cart-changing execution owner |
@@ -67,6 +68,6 @@ Playwright is optional and `--no-save`; the rehearsal and tests run without it. 
 
 ## Validation
 
-`npm test` runs offline. It covers the sample flow, no-op rerun, unapproved and approved reductions, approval binding and reevaluation, duplicate execution, cross-process execution ownership, storage failure before and after dispatch, tab disconnection, backend restart, uncertain outcomes, unreadable journal state, proposal validation (dropped restrictions, invented ids, explicit brand/size/quantity cross-checks), endpoint normalization, and the fail-closed retailer-session gate. Tests inject faults locally and have no retailer effects.
+`npm test` runs offline. It covers the sample flow, no-op rerun, unapproved and approved reductions, approval binding and reevaluation, duplicate execution, cross-process execution ownership, storage failure before and after dispatch, tab disconnection, backend restart, uncertain outcomes, unreadable journal state, proposal validation (dropped restrictions, invented ids, explicit brand/size/quantity cross-checks, inferred-vs-explicit attributes, unresolved-item gating), endpoint normalization and evidence conflicts, the shared read-only guard, and the fail-closed retailer-session gate. Tests inject faults locally and have no retailer effects.
 
 There are no live-retailer or live-model tests. The live slices are not implemented, and the signed-in context remains unverified. Do not describe the rehearsal as a verified real cart.
