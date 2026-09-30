@@ -8,6 +8,8 @@ Keep Landmark-specific endpoint evidence, response examples, session/location fi
 
 Observed anonymous discovery/read routes are recorded in the probe. Mutation payloads, authenticated context, populated cart behaviour, and safe retry semantics remain unverified. Do not infer unobserved endpoints from WooCommerce resemblance.
 
+The [signed-in read-only probe procedure](signed-in-read-probe-procedure.md) is **prepared but not executed**. It defines the repeatable, redacted method for establishing the operator's intended account/branch, populated cart structure, and cart-line-to-catalogue correspondence. Until it is run and its evidence reviewed, the signed-in context remains unverified.
+
 [ADR-0006](../../adr/0006-dedicated-retailer-session-with-human-login-and-handoff.md) establishes the intended dedicated session, human login, best-effort sign-in retention, and stop to retailer automation at manual checkout handoff. This is an accepted design boundary, not evidence that session persistence or browser handoff has been validated.
 
 Direct HTTP access, browser-context requests, browser library, session-storage mechanism, and fallback policy remain open [architecture questions](../../architecture/adr-questions.md). Any future integration work must respect the [agent safety contract](../../../AGENTS.md) and stop before final order/payment submission.

@@ -5,6 +5,7 @@ Use this directory for bounded research and experiments that test assumptions wi
 ## Investigation index
 
 - [2026-09-29: Landmark anonymous read-only probe](../integrations/landmark/read-only-probe-2026-09-29.md) — observed public discovery, simple-product detail, and an empty anonymous cart read; signed-in context and mutations remain unverified. Retailer-specific evidence is kept in the integration directory rather than duplicated here.
+- [Landmark signed-in read-only probe procedure](../integrations/landmark/signed-in-read-probe-procedure.md) — **prepared, not executed.** Repeatable read-only method for the operator's intended account/branch, populated cart structure, and cart-line-to-catalogue correspondence. No signed-in evidence exists yet.
 
 For each investigation, record:
 

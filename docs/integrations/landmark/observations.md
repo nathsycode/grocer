@@ -48,6 +48,8 @@ An observed cart-item response included data resembling the following; this is a
 
 The [2026-09-29 anonymous probe](read-only-probe-2026-09-29.md) independently observed search, simple-product detail, and an empty anonymous cart read. It records actual routes, the public-header comparison, and differing ID/price representations without retaining header or nonce values. It does not verify the operator's account/branch, populated cart lines, or mutations. The original owner-reported evidence above remains separate.
 
+The [signed-in read-only probe procedure](signed-in-read-probe-procedure.md) is prepared but **not executed**. It specifies how to observe the operator's signed-in context, populated cart structure, and cart-line-to-catalogue correspondence without mutation, and what may be retained. No signed-in finding has been made yet.
+
 ## Investigation checklist — not established in full
 
 Some discovery and anonymous-read behaviour now has preliminary evidence in the probe; unchecked entries remain incomplete, not necessarily wholly uninvestigated.
