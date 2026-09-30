@@ -1,0 +1,15 @@
+{
+  "name": "grocer-rehearsal",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local rehearsal slice: review and approve a grocery plan against a synthetic catalogue and cart. No live retailer or model calls.",
+  "scripts": {
+    "start": "node src/index.js",
+    "demo": "node scripts/demo.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
