@@ -39,6 +39,8 @@ const STATUS_BY_CODE = {
   uncertain: 409,
   'no-approval': 409,
   'already-executed': 409,
+  'handed-off': 409,
+  'not-verified': 409,
   'invalid-approval': 409,
   'stale-review': 409,
   'invalid-selection': 400,
@@ -155,7 +157,7 @@ async function handleApi(req, res, pathname, store, csrfToken, session) {
     return sendJson(res, 201, { run });
   }
 
-  const match = pathname.match(/^\/api\/run\/([^/]+)\/(items|selection|plan|approve|execute|reconcile)$/);
+  const match = pathname.match(/^\/api\/run\/([^/]+)\/(items|selection|plan|approve|execute|reconcile|handoff)$/);
   if (!match) return sendJson(res, 404, { error: 'unknown API route' });
   const [, runId, action] = match;
 
@@ -175,6 +177,13 @@ async function handleApi(req, res, pathname, store, csrfToken, session) {
   if (action === 'execute') {
     const result = store.startExecution(runId);
     return sendJson(res, 202, result);
+  }
+  if (action === 'handoff') {
+    // Record the terminal handoff first, then stop retailer automation and
+    // leave the dedicated browser usable by the operator (ADR-0006).
+    const run = store.handoff(runId);
+    await session?.handoff?.();
+    return sendJson(res, 200, { run, state: store.snapshot() });
   }
   if (action === 'reconcile') {
     return sendJson(res, 200, store.reconcile(runId));

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { CATALOG, parseSize, sizeEquals, formatMoney } from '../src/catalog.js';
+import { CATALOG, parseSize, sizeEquals, formatMoney, productById, productView } from '../src/catalog.js';
 import {
   interpretRequest,
   discoverCandidates,
@@ -130,7 +130,7 @@ test('revalidation pauses on a concurrent cart change or a price rise', () => {
     actions: [
       {
         productId: 'hl-beef-150g',
-        product: { name: 'Highlands Corned Beef 150 g' },
+        product: productView(productById('hl-beef-150g')),
         from: 1,
         priceMinor: 4690,
         priceDisplay: 'PHP 46.90',

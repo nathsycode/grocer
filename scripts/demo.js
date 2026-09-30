@@ -91,6 +91,17 @@ async function main() {
   await waitIdle(store2);
   show('cart after approved reduction', JSON.stringify(store2.simulator.cart()));
 
+  heading('8. Safe manual checkout handoff (automation stops)');
+  const handedOff = store.handoff(run.runId);
+  show('status', handedOff.status);
+  show('handoff', handedOff.handoff.note);
+  try {
+    store.reconcile(run.runId);
+    show('reconcile after handoff', 'unexpectedly allowed');
+  } catch (err) {
+    show('reconcile after handoff', `refused (${err.code})`);
+  }
+
   console.log('\nDemo complete. Data directories are temporary and were not cleaned automatically.');
 }
 

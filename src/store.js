@@ -11,6 +11,7 @@ import {
   computePlan,
   executableActions,
   revalidateApproval,
+  productIdentityEquals,
   verifyCart,
   norm,
 } from './domain.js';
@@ -77,6 +78,7 @@ export function reduce(records) {
           pauseReason: null,
           verification: null,
           cartObservation: null,
+          handoff: null,
           createdAt: r.ts,
           approvalConsumed: false,
         };
@@ -180,6 +182,12 @@ export function reduce(records) {
           run.status = 'completed';
           run.approvalConsumed = true;
           run.inFlight = false;
+        }
+        break;
+      case 'checkout_handoff':
+        if (run) {
+          run.status = 'handed-off';
+          run.handoff = r.handoff ?? { at: r.ts };
         }
         break;
       default:
@@ -616,6 +624,9 @@ export class Store {
     if (this.fatal) throw new StoreError('blocked', this.fatal.reason);
     if (this.retailerFatal) throw new StoreError('blocked', this.blockState().reason);
     const run = this.requireRun(runId);
+    if (run.status === 'handed-off') {
+      throw new StoreError('handed-off', 'this run was already handed off for manual checkout');
+    }
     if (this.state.openAttempts.length > 0) throw new StoreError('blocked', this.blockState().reason);
     if (this.executing) throw new StoreError('owned', 'this run is already executing');
     if (run.inFlight) {
@@ -692,7 +703,15 @@ export class Store {
         );
         return;
       }
-      if (prod && prod.priceMinor > action.priceMinor) {
+      if (!prod) {
+        this.pauseQuietly(runId, `${action.product.name}: the approved product is no longer in the catalogue; renewed review required`);
+        return;
+      }
+      if (!productIdentityEquals(action.product, prod)) {
+        this.pauseQuietly(runId, `${action.product.name}: product identity changed since approval; renewed review required`);
+        return;
+      }
+      if (prod.priceMinor > action.priceMinor) {
         this.pauseQuietly(
           runId,
           `${action.product.name}: unit price rose to ${formatMoney(prod.priceMinor, prod.currency)}; renewed approval required`,
@@ -767,6 +786,39 @@ export class Store {
   }
 
   /**
+   * Safe manual checkout handoff (ADR-0006). Terminal for the run: the operator
+   * takes over the dedicated retailer browser and every automated retailer read,
+   * navigation, and mutation for this run stops. The prepared cart is recorded
+   * as prepared, never as a verified purchase. Refused while any mutation
+   * outcome is unresolved, while execution is in flight, or before a verified
+   * result exists — an uncertain outcome cannot be hidden behind a handoff.
+   */
+  handoff(runId) {
+    if (this.fatal) throw new StoreError('blocked', this.fatal.reason);
+    if (this.retailerFatal) throw new StoreError('blocked', this.blockState().reason);
+    const run = this.requireRun(runId);
+    if (this.executing) throw new StoreError('owned', 'cannot hand off while this process is executing a run');
+    if (run.status === 'handed-off') throw new StoreError('handed-off', 'this run was already handed off for manual checkout');
+    if (this.state.openAttempts.length > 0) throw new StoreError('uncertain', this.blockState().reason);
+    if (this.state.ownership.held) throw new StoreError('owned', this.blockState().reason);
+    if (!run.verification) throw new StoreError('not-verified', 'the approved plan has not been executed and verified');
+
+    const verification = run.verification;
+    const handoff = {
+      at: new Date().toISOString(),
+      contextId: this.context.contextId,
+      fulfilled: verification.fulfilled.length,
+      discrepancies: verification.discrepancies.length,
+      extras: verification.extras.length,
+      unfulfilled: verification.unfulfilled.length,
+      note: 'Prepared cart handed to the operator for manual checkout. This is not a recorded purchase.',
+    };
+    this.#append('checkout_handoff', { runId, handoff });
+    this.refresh();
+    return this.requireRun(runId);
+  }
+
+  /**
    * Read-only reconciliation. Records a fresh cart observation and resolves
    * unresolved attempts using the simulator's own operation status. Never
    * mutates the cart, never force-unlocks, never deletes history.
@@ -776,6 +828,9 @@ export class Store {
     if (this.retailerFatal) throw new StoreError('blocked', this.blockState().reason);
     if (this.executing) throw new StoreError('owned', 'cannot reconcile while this process is executing a run');
     const run = this.requireRun(runId);
+    if (run.status === 'handed-off') {
+      throw new StoreError('handed-off', 'this run was handed off; automated retailer activity is stopped');
+    }
 
     // Never release a lock that another live process still owns: it may be
     // between actions, with no unresolved attempt recorded yet.

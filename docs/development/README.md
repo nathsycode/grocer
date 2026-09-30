@@ -2,12 +2,13 @@
 
 ## Current state
 
-The repository contains two implementation slices:
+The repository contains three implementation slices:
 
 - **Ticket 01** — a local rehearsal of review → explicit approval → simulated cart change → verification, using **only synthetic catalogue and cart data** with no live retailer or model calls. The simulator is a local JSON file and cannot reach Landmark.
 - **Ticket 03** — an evidence-backed review slice: a proposal-only model boundary, application-controlled discovery and independent validation, endpoint-aware identity/money normalization, and a dedicated retailer-session boundary. It ends at a reviewed, recorded approval; **live cart writes remain disabled**, and the live signed-in context stays unverified until ticket 02 evidence exists.
+- **Ticket 04 (offline part)** — executor-owned pre-dispatch revalidation (context, cart, price, product identity) and a terminal manual-checkout handoff that stops retailer automation and leaves the dedicated browser open. It runs against the simulator; **live cart writes remain disabled** and the ticket stays blocked on the ticket 02/03 live evidence.
 
-The rehearsal stack is recorded in [ADR-0009](../adr/0009-rehearsal-slice-implementation-stack.md) (Proposed); the review-slice stack is in [ADR-0010](../adr/0010-proposal-model-and-dedicated-session-slice.md) (Proposed). Read [AGENTS.md](../../AGENTS.md) before changes. The accepted decisions in [ADR-0001](../adr/0001-requested-quantities-as-cart-targets.md) through [ADR-0008](../adr/0008-minimal-durable-state-without-crash-resume.md) govern behaviour.
+The rehearsal stack is recorded in [ADR-0009](../adr/0009-rehearsal-slice-implementation-stack.md) (Proposed); the review-slice stack is in [ADR-0010](../adr/0010-proposal-model-and-dedicated-session-slice.md) (Proposed); the execution/handoff boundary is in [ADR-0011](../adr/0011-executor-revalidation-and-manual-handoff.md) (Proposed). Read [AGENTS.md](../../AGENTS.md) before changes. The accepted decisions in [ADR-0001](../adr/0001-requested-quantities-as-cart-targets.md) through [ADR-0008](../adr/0008-minimal-durable-state-without-crash-resume.md) govern behaviour.
 
 ## Setup
 
@@ -54,7 +55,7 @@ Playwright is optional and `--no-save`; the rehearsal and tests run without it. 
 | `src/store.js` | orchestration, run state, one cart-changing execution owner |
 | `src/server.js` | loopback HTTP surface with Host/Origin/CSRF guards |
 | `public/` | hand-written review UI |
-| `scripts/demo.js` | reproducible sample flow (ticket 01) |
+| `scripts/demo.js` | reproducible sample flow, including approved reduction and safe handoff (ticket 01/04) |
 | `scripts/review-demo.js` | offline evidence-backed review demo (ticket 03) |
 | `scripts/landmark-probe.js` | ticket 02 read-only investigation tooling (not application code) |
 
@@ -68,6 +69,6 @@ Playwright is optional and `--no-save`; the rehearsal and tests run without it. 
 
 ## Validation
 
-`npm test` runs offline. It covers the sample flow, no-op rerun, unapproved and approved reductions, approval binding and reevaluation, duplicate execution, cross-process execution ownership, storage failure before and after dispatch, tab disconnection, backend restart, uncertain outcomes, unreadable journal state, proposal validation (dropped restrictions, invented ids, explicit brand/size/quantity cross-checks, inferred-vs-explicit attributes, unresolved-item gating), endpoint normalization and evidence conflicts, the shared read-only guard, and the fail-closed retailer-session gate. Tests inject faults locally and have no retailer effects.
+`npm test` runs offline. It covers the sample flow, no-op rerun, unapproved and approved reductions, approval binding and reevaluation, duplicate execution, cross-process execution ownership, storage failure before and after dispatch, tab disconnection, backend restart, uncertain outcomes, unreadable journal state, proposal validation (dropped restrictions, invented ids, explicit brand/size/quantity cross-checks, inferred-vs-explicit attributes, unresolved-item gating), endpoint normalization and evidence conflicts, the shared read-only guard, the fail-closed retailer-session gate, executor identity/context revalidation, and the terminal handoff that stops automation. Tests inject faults locally and have no retailer effects.
 
 There are no live-retailer or live-model tests. The live slices are not implemented, and the signed-in context remains unverified. Do not describe the rehearsal as a verified real cart.

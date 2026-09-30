@@ -221,3 +221,43 @@ test('the session routes are absent when no session is configured', async () => 
     assert.equal(res.status, 404);
   });
 });
+
+// --- Ticket 04: handoff route -----------------------------------------------
+
+test('the handoff route records a terminal handoff and stops the session', async () => {
+  const calls = { handoff: 0 };
+  const session = {
+    status: () => ({ available: true, verified: false, state: 'not-checked', problems: [], cart: null }),
+    verifyContext: async () => ({ verified: false }),
+    readCart: async () => ({ ok: false, lines: [], problems: [] }),
+    async handoff() {
+      calls.handoff += 1;
+    },
+  };
+  await withSessionServer(async ({ base, headers, store }) => {
+    const created = await fetch(`${base}/api/run`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ requestText: DEMO_REQUEST }),
+    });
+    const { run } = await created.json();
+    await fetch(`${base}/api/run/${run.runId}/selection`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ selections: SELECTIONS }),
+    });
+    await fetch(`${base}/api/run/${run.runId}/plan`, { method: 'POST', headers });
+    await fetch(`${base}/api/run/${run.runId}/approve`, { method: 'POST', headers });
+    await fetch(`${base}/api/run/${run.runId}/execute`, { method: 'POST', headers });
+    while (store.executing) await new Promise((r) => setTimeout(r, 5));
+
+    const res = await fetch(`${base}/api/run/${run.runId}/handoff`, { method: 'POST', headers });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.run.status, 'handed-off');
+    assert.equal(calls.handoff, 1, 'the session automation is stopped');
+
+    const again = await fetch(`${base}/api/run/${run.runId}/handoff`, { method: 'POST', headers });
+    assert.equal(again.status, 409, 'a handed-off run cannot be handed off twice');
+  }, session);
+});

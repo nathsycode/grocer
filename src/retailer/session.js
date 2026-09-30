@@ -62,6 +62,7 @@ export function createRetailerSession({ dataDir, driver, expectedContext = { acc
   const profileDir = path.join(sessionDir, 'profile');
   let opened = false;
   let verified = false;
+  let stopped = false;
   let lastContext = null;
   let lastStatus = null;
   let lastCart = null;
@@ -89,6 +90,14 @@ export function createRetailerSession({ dataDir, driver, expectedContext = { acc
     // Any re-check revokes authority until it succeeds again, so a failed
     // session check can never leave a previous `verified` in force.
     verified = false;
+    if (stopped) {
+      return {
+        verified: false,
+        state: 'handed-off',
+        context: lastContext,
+        problems: ['retailer automation is stopped for manual checkout handoff'],
+      };
+    }
     try {
       await ensureOpen();
     } catch (err) {
@@ -134,6 +143,15 @@ export function createRetailerSession({ dataDir, driver, expectedContext = { acc
   }
 
   async function readCart() {
+    if (stopped) {
+      return {
+        ok: false,
+        lines: [],
+        context: lastContext,
+        observedAt: new Date().toISOString(),
+        problems: ['retailer automation is stopped for manual checkout handoff'],
+      };
+    }
     if (!verified) {
       const status = await verifyContext();
       if (!status.verified) {
@@ -183,12 +201,28 @@ export function createRetailerSession({ dataDir, driver, expectedContext = { acc
     profileDir,
     verifyContext,
     readCart,
+    /**
+     * Stop every automated retailer read, navigation, and mutation for the
+     * handoff while leaving the dedicated browser open for the operator's
+     * manual checkout (ADR-0006). Reads are refused immediately; detaching the
+     * browser's automation is best-effort.
+     */
+    async handoff() {
+      stopped = true;
+      verified = false;
+      try {
+        await driver.handoff?.();
+      } catch {
+        /* best effort: the stopped flag already refuses further reads */
+      }
+    },
     status() {
       return {
         available: true,
         opened,
         verified,
-        state: lastStatus?.state ?? 'not-checked',
+        stopped,
+        state: stopped ? 'handed-off' : (lastStatus?.state ?? 'not-checked'),
         context: lastContext,
         problems: lastStatus?.problems ?? [],
         cart: lastCart,
@@ -281,5 +315,13 @@ export function createPlaywrightDriver({ retailerOrigin = RETAILER_ORIGIN, chann
     page = null;
   }
 
-  return { open, sessionInfo, readCart, close };
+  async function handoff() {
+    // Stop intercepting the retailer origin so the operator's own manual
+    // checkout interactions are not mediated by the application, but do not
+    // close the browser: the operator continues in it (ADR-0006).
+    if (context) await context.unroute('**/*').catch(() => {});
+    page = null;
+  }
+
+  return { open, sessionInfo, readCart, close, handoff };
 }

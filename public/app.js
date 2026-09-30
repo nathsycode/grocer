@@ -327,7 +327,8 @@ function canApprove(run) {
       !run.inFlight &&
       !snapshot.blocked &&
       !snapshot.ownership.executing &&
-      run.status !== 'completed',
+      run.status !== 'completed' &&
+      run.status !== 'handed-off',
   );
 }
 
@@ -338,7 +339,8 @@ function canExecute(run) {
       !run.approvalConsumed &&
       !run.inFlight &&
       !snapshot.blocked &&
-      !snapshot.ownership.executing,
+      !snapshot.ownership.executing &&
+      run.status !== 'handed-off',
   );
 }
 
@@ -347,6 +349,12 @@ function verificationSection(run) {
   const v = run.verification;
   const list = (title, items, render) =>
     items.length ? `<h3>${title}</h3><ul class="plain">${items.map(render).join('')}</ul>` : '';
+  const handoff =
+    run.status === 'handed-off'
+      ? `<p class="approved">Handed off to manual checkout at ${esc(run.handoff?.at)}. This prepared cart is not a recorded purchase. Automated retailer activity is stopped for this run.</p>`
+      : run.status === 'completed'
+        ? `<p class="muted">The approved changes are verified above. Handing off stops all automated retailer activity and leaves the dedicated browser to you for manual checkout; it does not submit an order or payment.</p><button data-action="handoff">Hand off to manual checkout</button>`
+        : '';
   return `
   <section aria-labelledby="verify-h">
     <h2 id="verify-h">Simulated cart verification</h2>
@@ -355,6 +363,7 @@ function verificationSection(run) {
     ${list('Discrepancies', v.discrepancies, (d) => `<li>${esc(d.productId)}: expected ${d.expected}, observed ${d.observed}. ${esc(d.note)}</li>`)}
     ${list('Preserved extras (unrelated or different configuration)', v.extras, (e) => `<li>${esc(e.productId)} &times; ${e.quantity} — ${esc(e.label)}</li>`)}
     ${list('Unfulfilled requests', v.unfulfilled, (u) => `<li>${esc(u.raw)} — ${esc(u.reason)}</li>`)}
+    ${handoff}
   </section>`;
 }
 
@@ -435,6 +444,10 @@ root.addEventListener('click', async (event) => {
   }
   if (action === 'execute') {
     await act(() => api(`/api/run/${run.runId}/execute`));
+    return;
+  }
+  if (action === 'handoff') {
+    await act(() => api(`/api/run/${run.runId}/handoff`));
     return;
   }
   if (action === 'reconcile') {

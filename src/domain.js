@@ -269,8 +269,8 @@ export function executableActions(plan) {
 }
 
 /**
- * Compare a stored approval against current revision, context, cart, and
- * price. Any mismatch requires reevaluation rather than silent reuse
+ * Compare a stored approval against current revision, context, cart, price, and
+ * product identity. Any mismatch requires reevaluation rather than silent reuse
  * (ADR-0002, ADR-0003).
  */
 export function revalidateApproval(approval, { revision, contextId, cart, catalog = CATALOG }) {
@@ -284,13 +284,38 @@ export function revalidateApproval(approval, { revision, contextId, cart, catalo
       problems.push(`${a.product.name}: cart showed ${a.from} at approval, now ${current}`);
     }
     const prod = productById(a.productId, catalog);
-    if (prod && prod.priceMinor > a.priceMinor) {
+    if (!prod) {
+      problems.push(`${a.product.name}: the approved product is no longer in the catalogue`);
+      continue;
+    }
+    // Candidate identity is re-checked here, not trusted from the model or the
+    // stored approval: a re-identified product is not the approved product.
+    if (!productIdentityEquals(a.product, prod)) {
+      problems.push(`${a.product.name}: product identity changed since approval; renewed review required`);
+      continue;
+    }
+    if (prod.priceMinor > a.priceMinor) {
       problems.push(`${a.product.name}: unit price rose from ${a.priceDisplay} to ${formatMoney(prod.priceMinor, prod.currency)}`);
-    } else if (prod && prod.priceMinor < a.priceMinor) {
+    } else if (prod.priceMinor < a.priceMinor) {
       notes.push(`${a.product.name}: unit price fell to ${formatMoney(prod.priceMinor, prod.currency)}; approved action may proceed.`);
     }
   }
   return { ok: problems.length === 0, problems, notes };
+}
+
+/**
+ * The parts of a product an approval binds to. A catalogue entry that keeps its
+ * id but changes brand, name, variant, or size is a different product, so a
+ * stale approval must not execute against it.
+ */
+export function productIdentityEquals(approved, prod) {
+  if (!approved || !prod) return false;
+  return (
+    norm(approved.brand) === norm(prod.brand) &&
+    norm(approved.name) === norm(prod.name) &&
+    norm(approved.variant) === norm(prod.variant) &&
+    sizeEquals(approved.size, prod.size)
+  );
 }
 
 export function verifyCart(plan, cart, catalog = CATALOG) {

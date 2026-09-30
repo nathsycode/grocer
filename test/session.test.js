@@ -333,3 +333,34 @@ test('a non-read method is aborted', async () => {
   await applyReadOnlyRoute(route, { retailerOrigin: 'https://www.landmark.ph' });
   assert.equal(calls.abort, 1);
 });
+
+// --- Ticket 04: handoff stops automation but keeps the browser usable --------
+
+test('handoff stops automated reads and leaves the dedicated browser open', async () => {
+  const handoffCalls = { handoff: 0, close: 0 };
+  const driver = fakeDriver({
+    async handoff() {
+      handoffCalls.handoff += 1;
+    },
+    async close() {
+      handoffCalls.close += 1;
+    },
+  });
+  await withSession(
+    async ({ session }) => {
+      assert.equal((await session.verifyContext()).verified, true);
+      await session.handoff();
+      assert.equal(handoffCalls.handoff, 1, 'the driver automation is stopped');
+      assert.equal(handoffCalls.close, 0, 'the browser is not closed at handoff');
+
+      const after = await session.verifyContext();
+      assert.equal(after.verified, false);
+      assert.equal(after.state, 'handed-off');
+      const cart = await session.readCart();
+      assert.equal(cart.ok, false);
+      assert.ok(cart.problems.some((p) => /stopped/i.test(p)));
+      assert.equal(driver.calls.readCart, 0, 'no cart read is attempted after handoff');
+    },
+    { driver },
+  );
+});
