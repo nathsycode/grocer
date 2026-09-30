@@ -15,6 +15,7 @@ import {
 } from './domain.js';
 import { Journal, JournalError, ExecutionLock, isProcessAlive } from './journal.js';
 import { Simulator, SimTimeoutError } from './simulator.js';
+import { createProposer, controlledProposer, ProposerError, validateProposal, validateRankings } from './proposer.js';
 
 export class StoreError extends Error {
   constructor(code, message) {
@@ -66,6 +67,7 @@ export function reduce(records) {
           items: r.items ?? [],
           candidates: r.candidates ?? {},
           selections: r.selections ?? {},
+          interpretation: r.interpretation ?? null,
           plan: null,
           approval: null,
           approvalValid: false,
@@ -195,16 +197,18 @@ export function createStore({
   context = SIM_CONTEXT,
   stepDelayMs = 0,
   faults = {},
+  proposer,
 } = {}) {
-  return new Store({ dataDir, catalog, context, stepDelayMs, faults });
+  return new Store({ dataDir, catalog, context, stepDelayMs, faults, proposer });
 }
 
 export class Store {
-  constructor({ dataDir, catalog, context, stepDelayMs, faults }) {
+  constructor({ dataDir, catalog, context, stepDelayMs, faults, proposer }) {
     this.dataDir = dataDir;
     this.catalog = catalog;
     this.context = context;
     this.stepDelayMs = stepDelayMs;
+    this.proposer = proposer ?? createProposer();
     this.journal = new Journal(path.join(dataDir, 'journal.jsonl'));
     this.lock = new ExecutionLock(path.join(dataDir, 'execution.lock'));
     this.simulator = new Simulator(path.join(dataDir, 'simulator.json'), { faults });
@@ -347,6 +351,10 @@ export class Store {
         context: this.context,
         stepDelayMs: this.stepDelayMs,
       },
+      model: {
+        provider: this.proposer?.provider ?? 'none',
+        configured: Boolean(this.proposer?.configured),
+      },
       blocked: this.blockState(),
       ownership: {
         held: this.state.ownership.held,
@@ -415,15 +423,17 @@ export class Store {
     if (this.executing) throw new StoreError('owned', 'a cart-changing run is executing');
   }
 
-  createRun(requestText) {
+  createRun(requestText, interpretation = null) {
     if (this.fatal) throw new StoreError('blocked', this.fatal.reason);
     if (this.retailerFatal) throw new StoreError('blocked', this.blockState().reason);
     if (typeof requestText !== 'string' || !requestText.trim()) {
       throw new StoreError('invalid', 'request text is required');
     }
     const runId = crypto.randomUUID();
-    const items = interpretRequest(requestText, this.catalog);
-    const candidates = Object.fromEntries(items.map((i) => [i.id, discoverCandidates(i, this.catalog)]));
+    const items = interpretation?.items ?? interpretRequest(requestText, this.catalog);
+    const candidates =
+      interpretation?.candidates ??
+      Object.fromEntries(items.map((i) => [i.id, discoverCandidates(i, this.catalog)]));
     this.#append('run_created', {
       runId,
       requestText,
@@ -431,9 +441,76 @@ export class Store {
       items,
       candidates,
       selections: defaultSelections(items, candidates),
+      interpretation: interpretation?.meta ?? null,
     });
     this.refresh();
     return this.requireRun(runId);
+  }
+
+  /**
+   * The evidence-backed entry point: one bounded proposal, application-
+   * controlled discovery, and independent validation before a run exists. When
+   * no model is configured the offline interpreter stands in and the run is
+   * labelled a fallback. Model failure creates no run (ADR-0007).
+   */
+  async planRun(requestText) {
+    this.assertPlanningAllowed();
+    if (typeof requestText !== 'string' || !requestText.trim()) {
+      throw new StoreError('invalid', 'request text is required');
+    }
+    const configured = Boolean(this.proposer?.configured);
+    const proposer = configured ? this.proposer : controlledProposer();
+
+    let rawInterpretation;
+    try {
+      rawInterpretation = await proposer.interpret({ requestText });
+    } catch (err) {
+      if (err instanceof ProposerError) throw new StoreError('model-failed', `model interpretation failed: ${err.message}`);
+      throw err;
+    }
+    // The store validates independently, whatever the provider returned.
+    const interpretation = validateProposal(rawInterpretation, { requestText });
+    if (!interpretation.ok) {
+      throw new StoreError('model-failed', 'model output was unusable; no run was created');
+    }
+
+    const items = interpretation.items;
+    const baseCandidates = Object.fromEntries(items.map((i) => [i.id, discoverCandidates(i, this.catalog)]));
+    const candidatesByLine = Object.fromEntries(items.map((i) => [i.lineIndex, baseCandidates[i.id]]));
+
+    let rawRanked = { rankings: [] };
+    try {
+      rawRanked = await proposer.rank({ requestText, items, candidatesByLine });
+    } catch (err) {
+      if (err instanceof ProposerError) throw new StoreError('model-failed', `model ranking failed: ${err.message}`);
+      throw err;
+    }
+    const rankingProblems = [];
+    const rankings = validateRankings(rawRanked?.rankings, {
+      candidatesByLine,
+      lineCount: items.length,
+      problems: rankingProblems,
+    });
+
+    const rankingsByItem = {};
+    for (const ranking of rankings) {
+      const item = items.find((i) => i.lineIndex === ranking.lineIndex);
+      if (!item) continue;
+      (rankingsByItem[item.id] ??= {})[ranking.productId] = { rank: ranking.rank, rationale: ranking.rationale };
+    }
+    const candidates = Object.fromEntries(
+      items.map((i) => [i.id, discoverCandidates(i, this.catalog, rankingsByItem[i.id] ?? {})]),
+    );
+
+    return this.createRun(requestText, {
+      items,
+      candidates,
+      meta: {
+        provider: proposer.provider,
+        fallback: !configured,
+        problems: [...(interpretation.problems ?? []), ...rankingProblems],
+      },
+    });
   }
 
   correctRequest(runId, items) {

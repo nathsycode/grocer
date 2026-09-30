@@ -1,0 +1,334 @@
+// Dedicated retailer session boundary (ADR-0006).
+//
+// The retailer browser session is isolated from the operator's everyday
+// browser, retained under .local/ (gitignored, 0700) and never written to the
+// safety journal, logs, or model context. The operator signs in directly; this
+// module never sees credentials or verification codes.
+//
+// Every read is gated on a *verified* shopping context: a known intended
+// account and branch, a live sign-in, and a successful read. Wrong/unknown
+// account or branch, expired authentication, or a failed cart read prevent the
+// context from becoming execution-ready. Ticket 02 has not yet established how
+// to identify the signed-in account/branch, so the real Playwright driver
+// deliberately reports them as unknown and the gate stays closed.
+//
+// The browser library is imported lazily, so the dependency-free rehearsal runs
+// without Playwright installed.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { normalizeObservedProduct } from './normalize.js';
+
+export class SessionError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
+export const RETAILER_ORIGIN = 'https://www.landmark.ph';
+
+/**
+ * Read-only gate for the dedicated session. Mirrors the probe's boundary:
+ * only same-origin GET/HEAD reaches the retailer, redirects are never followed,
+ * and checkout/logout navigation is blocked. It is a safety net, not a licence
+ * to mutate.
+ */
+export function classifyReadRequest({ method, url, retailerOrigin = RETAILER_ORIGIN, isNavigation = false, resourceType = 'other' }) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { action: 'abort', reason: 'unparseable-url' };
+  }
+  const isRead = method === 'GET' || method === 'HEAD';
+  if (parsed.origin !== retailerOrigin) {
+    const renderable = new Set(['script', 'stylesheet', 'image', 'font', 'media']);
+    if (isRead && renderable.has(resourceType)) return { action: 'allow' };
+    return { action: 'abort', reason: 'cross-origin' };
+  }
+  if (!isRead) return { action: 'abort', reason: `non-read-method:${method}` };
+  if (isNavigation && /^\/(checkout|logout|my-account\/orders)/i.test(parsed.pathname)) {
+    return { action: 'abort', reason: 'blocked-navigation' };
+  }
+  return { action: 'allow' };
+}
+
+const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+
+export function classifyReadResponse({ status, location = null, baseUrl }) {
+  if (!REDIRECT_STATUS.has(status)) return { action: 'fulfill' };
+  let destination = null;
+  try {
+    destination = location ? new URL(location, baseUrl).href : null;
+  } catch {
+    destination = null;
+  }
+  return { action: 'abort', reason: 'redirect-not-followed', destination };
+}
+
+/** Journal-safe cart lines: no line key, no raw session or header values. */
+export function redactCartLines(lines) {
+  return (lines ?? []).map((line) => ({
+    productId: line.productId ?? null,
+    quantity: line.quantity ?? null,
+    sku: line.sku ?? null,
+    money: line.money
+      ? {
+          minor: line.money.minor ?? null,
+          currency: line.money.currency ?? null,
+          display: line.money.display ?? null,
+          unresolved: Boolean(line.money.unresolved),
+        }
+      : null,
+  }));
+}
+
+/**
+ * @param {object} options
+ * @param {string} options.dataDir          root local data directory (.local)
+ * @param {object} options.driver           injected browser driver (see createPlaywrightDriver)
+ * @param {{account:string,branch:string}} options.expectedContext
+ */
+export function createRetailerSession({ dataDir, driver, expectedContext = { account: null, branch: null } }) {
+  const sessionDir = path.join(dataDir, 'retailer-session');
+  const profileDir = path.join(sessionDir, 'profile');
+  let opened = false;
+  let verified = false;
+  let lastContext = null;
+  let lastStatus = null;
+  let lastCart = null;
+
+  function prepareProfile() {
+    fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+    // mkdir mode is ignored when the directory already exists, so tighten it.
+    for (const dir of [sessionDir, profileDir]) {
+      try {
+        fs.chmodSync(dir, 0o700);
+      } catch {
+        /* best effort; a filesystem without POSIX modes is out of scope */
+      }
+    }
+  }
+
+  async function ensureOpen() {
+    if (opened) return;
+    prepareProfile();
+    await driver.open({ profileDir });
+    opened = true;
+  }
+
+  async function verifyContext() {
+    try {
+      await ensureOpen();
+    } catch (err) {
+      return { verified: false, state: 'unknown', context: null, problems: [err.message] };
+    }
+    let info;
+    try {
+      info = await driver.sessionInfo();
+    } catch (err) {
+      return { verified: false, state: 'unknown', context: null, problems: [`session check failed: ${err.message}`] };
+    }
+    const context = { account: info?.account ?? null, branch: info?.branch ?? null };
+    const problems = [...(info?.problems ?? [])];
+    if (info?.expired) {
+      verified = false;
+      lastContext = context;
+      return {
+        verified: false,
+        state: 'expired',
+        context,
+        problems: [...problems, 'authentication expired; sign in again in the dedicated retailer browser'],
+      };
+    }
+    if (!info?.signedIn) {
+      verified = false;
+      lastContext = context;
+      return { verified: false, state: 'signed-out', context, problems: [...problems, 'not signed in to the retailer browser'] };
+    }
+    if (!info.account) problems.push('the signed-in account could not be established');
+    else if (expectedContext.account && info.account !== expectedContext.account) {
+      problems.push('wrong account: the signed-in account is not the configured one');
+    }
+    if (!info.branch) problems.push('the branch/location could not be established');
+    else if (expectedContext.branch && info.branch !== expectedContext.branch) {
+      problems.push('wrong branch: the selected branch is not the configured one');
+    }
+    verified = problems.length === 0;
+    lastContext = context;
+    lastStatus = { verified, state: verified ? 'verified' : 'signed-in-unverified', context, problems };
+    return lastStatus;
+  }
+
+  async function readCart() {
+    if (!verified) {
+      const status = await verifyContext();
+      if (!status.verified) {
+        return {
+          ok: false,
+          lines: [],
+          context: status.context,
+          observedAt: new Date().toISOString(),
+          problems: ['the shopping context is not verified', ...status.problems],
+        };
+      }
+    }
+    try {
+      const result = await driver.readCart();
+      const lines = Array.isArray(result?.lines) ? result.lines : [];
+      lastCart = {
+        ok: true,
+        lines: redactCartLines(lines),
+        context: result?.context ?? lastContext,
+        observedAt: new Date().toISOString(),
+        note: lines.length ? null : 'the cart read succeeded but returned no lines',
+      };
+      return { ...lastCart, problems: result?.problems ?? [] };
+    } catch (err) {
+      verified = false;
+      return {
+        ok: false,
+        lines: [],
+        context: lastContext,
+        observedAt: new Date().toISOString(),
+        problems: [`cart read failed: ${err.message}`],
+      };
+    }
+  }
+
+  return {
+    sessionDir,
+    profileDir,
+    verifyContext,
+    readCart,
+    status() {
+      return {
+        available: true,
+        opened,
+        verified,
+        state: lastStatus?.state ?? 'not-checked',
+        context: lastContext,
+        problems: lastStatus?.problems ?? [],
+        cart: lastCart,
+      };
+    },
+    async close() {
+      try {
+        await driver.close?.();
+      } finally {
+        opened = false;
+      }
+    },
+  };
+}
+
+/**
+ * Backend-owned Playwright driver. Kept thin and lazy: it launches the isolated
+ * persistent context, installs the read-only guard, and reads the cart through
+ * the observed `/api/cart` route. Account/branch identification is not
+ * established by ticket 02, so `sessionInfo` reports them unknown and the gate
+ * stays closed until retailer evidence resolves it.
+ */
+export function createPlaywrightDriver({ retailerOrigin = RETAILER_ORIGIN, channel = 'chrome', headless = false } = {}) {
+  let context = null;
+  let page = null;
+  let chromium = null;
+
+  async function open({ profileDir }) {
+    try {
+      ({ chromium } = await import('playwright'));
+    } catch {
+      throw new SessionError('driver-unavailable', 'playwright is not installed; run: npm install --no-save playwright@1.63.0');
+    }
+    fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+    context = await chromium.launchPersistentContext(profileDir, {
+      headless,
+      channel,
+      viewport: { width: 1280, height: 900 },
+      serviceWorkers: 'block',
+    });
+    page = context.pages()[0] ?? (await context.newPage());
+    await context.route('**/*', async (route) => {
+      const request = route.request();
+      const decision = classifyReadRequest({
+        method: request.method(),
+        url: request.url(),
+        retailerOrigin,
+        isNavigation: request.isNavigationRequest(),
+        resourceType: request.resourceType(),
+      });
+      if (decision.action === 'abort') return route.abort('blockedbyclient');
+      let origin = null;
+      try {
+        origin = new URL(request.url()).origin;
+      } catch {
+        /* classifyReadRequest already rejected unparseable URLs */
+      }
+      if (origin !== retailerOrigin) return route.continue();
+      let response;
+      try {
+        response = await route.fetch({ maxRedirects: 0 });
+      } catch {
+        return route.abort('blockedbyclient');
+      }
+      const disposition = classifyReadResponse({
+        status: response.status(),
+        location: response.headers()['location'],
+        baseUrl: request.url(),
+      });
+      if (disposition.action === 'abort') return route.abort('blockedbyclient');
+      return route.fulfill({ response });
+    });
+  }
+
+  async function sessionInfo() {
+    if (!page) throw new SessionError('not-open', 'the retailer browser is not open');
+    // Ticket 02 has not established a reliable signed-in account/branch
+    // identifier. Reporting them unknown keeps the gate closed rather than
+    // guessing from page chrome.
+    return {
+      signedIn: false,
+      expired: false,
+      account: null,
+      branch: null,
+      problems: ['signed-in account and branch identification is not established; ticket 02 evidence is required'],
+    };
+  }
+
+  async function readCart() {
+    if (!page) throw new SessionError('not-open', 'the retailer browser is not open');
+    const captured = new Promise((resolve) => {
+      const onResponse = async (res) => {
+        let parsed;
+        try {
+          parsed = new URL(res.url());
+        } catch {
+          return;
+        }
+        if (parsed.origin !== retailerOrigin || !/^\/api\/cart(\/|$)/.test(parsed.pathname)) return;
+        page.off('response', onResponse);
+        try {
+          resolve(await res.json());
+        } catch {
+          resolve(null);
+        }
+      };
+      page.on('response', onResponse);
+    });
+    await page.goto(`${retailerOrigin}/cart`, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    const body = await captured;
+    const items = body?.cart?.items;
+    if (!Array.isArray(items)) throw new SessionError('cart-unreadable', 'the cart response had no readable items array');
+    const lines = items.map((item) => normalizeObservedProduct(item, { source: 'cart' }));
+    return { lines, context: null, problems: [] };
+  }
+
+  async function close() {
+    if (context) await context.close().catch(() => {});
+    context = null;
+    page = null;
+  }
+
+  return { open, sessionInfo, readCart, close };
+}

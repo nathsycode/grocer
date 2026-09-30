@@ -90,5 +90,6 @@ export function productView(prod) {
     currency: prod.currency.code,
     evidenceConflict: Boolean(prod.evidenceConflict),
     evidenceNote: prod.evidenceNote ?? null,
+    provenance: prod.provenance ?? { source: 'synthetic-catalogue' },
   };
 }

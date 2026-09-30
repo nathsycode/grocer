@@ -87,7 +87,7 @@ function render() {
   }
   renderBanner();
   const run = snapshot.run;
-  const parts = [cartSection()];
+  const parts = [sessionSection(), cartSection()];
   parts.push(requestSection(run));
   if (run) {
     ensureDraft(run);
@@ -102,9 +102,44 @@ function renderBanner() {
     ? `<p class="blocked"><strong>Execution blocked.</strong> ${esc(snapshot.blocked.reason)}</p>`
     : '';
   const err = notice ? `<p class="blocked">${esc(notice)}</p>` : '';
+  const model = snapshot.model
+    ? `<p class="muted">Model proposer: ${esc(snapshot.model.provider)}${
+        snapshot.model.configured ? ' (proposal-only; no retailer tools)' : ' — none configured, offline fallback'
+      }</p>`
+    : '';
   banner.innerHTML = `
     <p class="sim-label">${esc(snapshot.simulation.label)}</p>
+    ${model}
     ${blocked}${err}`;
+}
+
+function sessionSection() {
+  const s = snapshot.retailerSession ?? { available: false };
+  if (!s.available) return '';
+  const state = s.state ?? 'not-checked';
+  const problems = (s.problems ?? []).map((p) => `<li>${esc(p)}</li>`).join('');
+  const cart = s.cart?.lines ?? [];
+  return `
+  <section aria-labelledby="session-h">
+    <h2 id="session-h">Dedicated retailer session</h2>
+    <p class="muted">
+      Sign-in happens directly in the isolated retailer browser — never in this review UI. Retained session
+      state stays under <code>.local/</code>, outside the safety journal and model context.
+    </p>
+    <p>Context check: <strong>${esc(state)}</strong>${
+      s.verified ? ' — account and branch verified' : ' — a plan cannot become execution-ready until this verifies'
+    }</p>
+    ${problems ? `<ul class="plain">${problems}</ul>` : ''}
+    ${
+      cart.length
+        ? `<h3>Observed existing cart</h3><ul class="plain">${cart
+            .map((l) => `<li>${esc(l.productId)} &times; ${l.quantity} ${l.money?.display ? `— ${esc(l.money.display)}` : ''}</li>`)
+            .join('')}</ul>`
+        : '<p class="muted">No verified live cart contents observed.</p>'
+    }
+    <button class="secondary" data-action="verify-session">Sign in / verify context in retailer browser</button>
+    <button class="secondary" data-action="read-cart">Read verified cart</button>
+  </section>`;
 }
 
 function cartSection() {
@@ -138,9 +173,25 @@ function requestSection(run) {
 }
 
 function interpretationSection(run) {
+  const interp = run.interpretation;
+  const problems = interp?.problems ?? [];
   return `
   <section aria-labelledby="review-h">
     <h2 id="review-h">Review interpreted request <span class="muted">(revision ${run.revision})</span></h2>
+    ${
+      interp
+        ? `<p class="muted">Interpretation: ${esc(interp.provider)}${
+            interp.fallback ? ' (offline fallback — no model configured)' : ' (proposal-only model)'
+          }</p>`
+        : ''
+    }
+    ${
+      problems.length
+        ? `<details class="notice"><summary>Independent validation notes (${problems.length})</summary><ul>${problems
+            .map((p) => `<li>${esc(p)}</li>`)
+            .join('')}</ul></details>`
+        : ''
+    }
     <p class="muted">Original text stays visible beside its interpretation. Correct anything that is wrong; a change requires a fresh approval.</p>
     ${draft.items.map((item, index) => itemBlock(run, item, index)).join('')}
     <button class="secondary" data-action="save-corrections">Save corrections</button>
@@ -172,6 +223,16 @@ function itemBlock(run, item, index) {
       <input type="checkbox" data-item="${index}" data-field="noSubstitution" ${item.noSubstitution ? 'checked' : ''} />
       No substitutions for this item (explicit restriction)
     </label>
+    ${
+      original?.assumptions?.length
+        ? `<p class="notice">Assumptions: ${original.assumptions.map(esc).join('; ')}</p>`
+        : ''
+    }
+    ${
+      original?.unresolved?.length
+        ? `<p class="blocked">Unresolved: ${original.unresolved.map(esc).join('; ')}</p>`
+        : ''
+    }
     <fieldset class="candidates">
       <legend>Concrete candidates</legend>
       ${rows}
@@ -187,13 +248,17 @@ function itemBlock(run, item, index) {
 
 function candidateRow(item, candidate, selected) {
   const p = candidate.product;
+  const provenance = p.provenance?.source ?? 'unknown';
   return `
   <label class="candidate ${candidate.selectable ? '' : 'disabled'}">
     <input type="radio" name="choice-${esc(item.id)}" value="${esc(p.id)}" ${selected === p.id ? 'checked' : ''} ${candidate.selectable ? '' : 'disabled'} />
     <span class="badge badge-${candidate.color}">${esc(candidate.color)}</span>
+    ${candidate.modelRank != null ? `<span class="badge">model rank ${candidate.modelRank}</span>` : ''}
     <span><strong>${esc(p.brand)} ${esc(p.name)}</strong> ${esc(p.sizeDisplay)}</span>
     <span>${esc(p.priceDisplay)}</span>
     <span class="cand-reason">${esc(candidate.reason)}</span>
+    ${candidate.modelRationale ? `<span class="cand-reason muted">model: ${esc(candidate.modelRationale)}</span>` : ''}
+    <span class="cand-reason muted">evidence: ${esc(provenance)}${p.evidenceNote ? ` — ${esc(p.evidenceNote)}` : ''}</span>
   </label>`;
 }
 
@@ -338,6 +403,14 @@ root.addEventListener('click', async (event) => {
     draft = null;
     requestDraft = null;
     await act(() => api('/api/run', { requestText: text }));
+    return;
+  }
+  if (action === 'verify-session') {
+    await act(() => api('/api/retailer/verify'));
+    return;
+  }
+  if (action === 'read-cart') {
+    await act(() => api('/api/retailer/cart'));
     return;
   }
   if (!run) return;

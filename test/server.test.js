@@ -166,3 +166,58 @@ test('execution continues after the review tab disconnects and is not replayed o
     { stepDelayMs: 40 },
   );
 });
+
+// --- Retailer session surface (ticket 03) -----------------------------------
+
+async function withSessionServer(fn, session) {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'grocer-session-http-'));
+  const store = createStore({ dataDir, stepDelayMs: 0 });
+  store.load();
+  store.simulator.seedCart(DEMO_CART);
+  const { server, csrfToken, url } = await startServer(store, { port: 0, session });
+  const base = url.replace(/\/$/, '');
+  const headers = { 'content-type': 'application/json', origin: base, 'x-rehearsal-csrf': csrfToken };
+  try {
+    return await fn({ store, base, headers });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+const fakeSession = {
+  status: () => ({ available: true, verified: false, state: 'not-checked', problems: [], cart: null }),
+  verifyContext: async () => ({ verified: false, state: 'signed-in-unverified', problems: ['account unknown'] }),
+  readCart: async () => ({ ok: false, lines: [], problems: ['context not verified'] }),
+};
+
+test('state reports the retailer session without exposing session values', async () => {
+  await withSessionServer(async ({ base }) => {
+    const body = await (await fetch(`${base}/api/state`)).json();
+    assert.equal(body.retailerSession.available, true);
+    assert.equal(body.retailerSession.verified, false);
+    const session = JSON.stringify(body.retailerSession);
+    assert.doesNotMatch(session, /cookie|nonce|authorization|lineKey|password/i);
+  }, fakeSession);
+});
+
+test('the session verify and cart routes are state-changing and require the CSRF token', async () => {
+  await withSessionServer(async ({ base, headers }) => {
+    const noToken = await fetch(`${base}/api/retailer/verify`, { method: 'POST', headers: { origin: base } });
+    assert.equal(noToken.status, 403);
+
+    const verify = await fetch(`${base}/api/retailer/verify`, { method: 'POST', headers });
+    assert.equal(verify.status, 200);
+    assert.equal((await verify.json()).session.verified, false);
+
+    const cart = await fetch(`${base}/api/retailer/cart`, { method: 'POST', headers });
+    assert.equal(cart.status, 200);
+    assert.equal((await cart.json()).cart.ok, false);
+  }, fakeSession);
+});
+
+test('the session routes are absent when no session is configured', async () => {
+  await withServer(async ({ base, headers }) => {
+    const res = await fetch(`${base}/api/retailer/verify`, { method: 'POST', headers });
+    assert.equal(res.status, 404);
+  });
+});

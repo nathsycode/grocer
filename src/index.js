@@ -7,6 +7,8 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createStore } from './store.js';
 import { startServer } from './server.js';
+import { createProposer } from './proposer.js';
+import { createRetailerSession, createPlaywrightDriver } from './retailer/session.js';
 
 export const DEMO_REQUEST = `Highlands Corned Beef 150g x2
 Pasta Roma Fusilli 500g x2`;
@@ -26,12 +28,26 @@ export async function main() {
   const port = Number(process.env.PORT ?? 4180);
   const stepDelayMs = Number(process.env.REHEARSAL_STEP_DELAY_MS ?? 250);
 
-  const store = createStore({ dataDir, stepDelayMs });
+  const store = createStore({ dataDir, stepDelayMs, proposer: createProposer() });
   store.load();
   if (!store.simulator.exists()) store.simulator.seedCart(DEMO_CART);
 
-  const { url } = await startServer(store, { port });
+  const session =
+    process.env.RETAILER_SESSION === 'off'
+      ? null
+      : createRetailerSession({
+          dataDir,
+          driver: createPlaywrightDriver({ channel: process.env.RETAILER_CHANNEL ?? 'chrome' }),
+          expectedContext: { account: process.env.RETAILER_ACCOUNT ?? null, branch: process.env.RETAILER_BRANCH ?? null },
+        });
+
+  const { url } = await startServer(store, { port, session });
   console.log(`SIMULATION — synthetic catalogue and cart; this build cannot reach Landmark.`);
+  console.log(
+    store.proposer.configured
+      ? `Model proposer: ${store.proposer.provider} (proposal-only; no retailer tools).`
+      : 'Model proposer: none configured — using the labelled offline interpreter fallback.',
+  );
   console.log(`Local review UI: ${url}`);
   console.log(`Data directory:  ${dataDir}`);
   return { store, url };

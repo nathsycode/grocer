@@ -45,6 +45,7 @@ const STATUS_BY_CODE = {
   invalid: 400,
   'not-found': 404,
   storage: 500,
+  'model-failed': 502,
 };
 
 function sendJson(res, status, body) {
@@ -87,7 +88,7 @@ const CONTENT_TYPES = {
   '.ico': 'image/x-icon',
 };
 
-export function createApp(store, { publicDir = path.resolve('public') } = {}) {
+export function createApp(store, { publicDir = path.resolve('public'), session = null } = {}) {
   const csrfToken = crypto.randomUUID();
 
   const server = http.createServer(async (req, res) => {
@@ -100,7 +101,7 @@ export function createApp(store, { publicDir = path.resolve('public') } = {}) {
       const { pathname } = url;
 
       if (pathname.startsWith('/api/')) {
-        return await handleApi(req, res, pathname, store, csrfToken);
+        return await handleApi(req, res, pathname, store, csrfToken, session);
       }
       return serveStatic(res, publicDir, pathname);
     } catch (err) {
@@ -114,9 +115,13 @@ export function createApp(store, { publicDir = path.resolve('public') } = {}) {
   return { server, csrfToken };
 }
 
-async function handleApi(req, res, pathname, store, csrfToken) {
+async function handleApi(req, res, pathname, store, csrfToken, session) {
   if (req.method === 'GET' && pathname === '/api/state') {
-    return sendJson(res, 200, { ...store.load(), csrfToken });
+    return sendJson(res, 200, {
+      ...store.load(),
+      csrfToken,
+      retailerSession: session ? session.status() : { available: false },
+    });
   }
   if (req.method === 'GET' && pathname === '/api/journal') {
     store.refresh();
@@ -137,8 +142,16 @@ async function handleApi(req, res, pathname, store, csrfToken) {
 
   const body = await readJsonBody(req);
 
+  if (pathname === '/api/retailer/verify' || pathname === '/api/retailer/cart') {
+    if (!session) return sendJson(res, 404, { error: 'no retailer session is configured' });
+    if (pathname === '/api/retailer/verify') {
+      return sendJson(res, 200, { session: await session.verifyContext() });
+    }
+    return sendJson(res, 200, { cart: await session.readCart(), session: session.status() });
+  }
+
   if (pathname === '/api/run') {
-    const run = store.createRun(body.requestText);
+    const run = await store.planRun(body.requestText);
     return sendJson(res, 201, { run });
   }
 
@@ -182,9 +195,10 @@ function serveStatic(res, publicDir, pathname) {
   fs.createReadStream(filePath).pipe(res);
 }
 
-export function startServer(store, { port = 4180, host = '127.0.0.1', publicDir } = {}) {
+export function startServer(store, { port = 4180, host = '127.0.0.1', publicDir, session = null } = {}) {
   const { server, csrfToken } = createApp(store, {
     publicDir: publicDir ?? path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public'),
+    session,
   });
   return new Promise((resolve, reject) => {
     server.once('error', reject);

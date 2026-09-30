@@ -173,3 +173,56 @@ test('a none action is a discrepancy when the observed cart does not match', () 
   assert.equal(result.fulfilled.length, 0);
   assert.equal(result.discrepancies.length, 1);
 });
+
+// --- Evidence-backed review (ticket 03) -------------------------------------
+
+test('a model ranking is shown beside a candidate but does not change its gate', () => {
+  const candidates = discoverCandidates(item(), CATALOG, {
+    'hl-beef-150g': { rank: 1, rationale: 'exact brand, size, and variant' },
+  });
+  const green = candidates.find((c) => c.product.id === 'hl-beef-150g');
+  assert.equal(green.color, 'green');
+  assert.equal(green.modelRank, 1);
+  assert.match(green.modelRationale, /exact/);
+
+  const orange = candidates.find((c) => c.product.id === 'hl-beef-260g');
+  assert.equal(orange.color, 'orange');
+  assert.equal(orange.modelRank, null);
+});
+
+test('a top model ranking cannot make conflicting evidence selectable', () => {
+  const candidates = discoverCandidates(item(), CATALOG, {
+    'conflict-beef-150g': { rank: 1, rationale: 'model is confident' },
+  });
+  const conflict = candidates.find((c) => c.product.id === 'conflict-beef-150g');
+  assert.equal(conflict.color, 'red');
+  assert.equal(conflict.selectable, false);
+  assert.equal(conflict.modelRank, 1, 'the proposal stays visible even though it was rejected');
+});
+
+test('a top model ranking cannot turn an unspecified size green', () => {
+  const unspecified = item({ raw: 'McCormick Italian Seasoning x1', name: 'Italian Seasoning', brand: 'McCormick', size: null, quantity: 1 });
+  const candidates = discoverCandidates(unspecified, CATALOG, {
+    'mccormick-seasoning-200g': { rank: 1, rationale: 'only result' },
+  });
+  const candidate = candidates.find((c) => c.product.id === 'mccormick-seasoning-200g');
+  assert.equal(candidate.color, 'yellow');
+});
+
+test('a candidate carries its evidence provenance', () => {
+  const [candidate] = discoverCandidates(item());
+  assert.ok(candidate.product.provenance);
+  assert.equal(candidate.product.provenance.source, 'synthetic-catalogue');
+});
+
+test('the reviewed plan carries material assumptions and unresolved interpretation', () => {
+  const [parsed] = interpretRequest('Full cream milk');
+  const withReview = {
+    ...parsed,
+    assumptions: ['Quantity 2 was inferred by the model; the text states no quantity.'],
+    unresolved: ['Size was not stated.'],
+  };
+  const plan = computePlan([withReview], { 'item-1': { productId: 'arla-milk-1l' } }, {}, 'ctx', 1);
+  assert.deepEqual(plan.actions[0].assumptions, withReview.assumptions);
+  assert.deepEqual(plan.actions[0].unresolved, withReview.unresolved);
+});

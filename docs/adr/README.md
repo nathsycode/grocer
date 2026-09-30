@@ -13,6 +13,7 @@ Use ADRs for consequential architecture choices and trade-offs. The bootstrap es
 - [ADR-0007: Use a proposal-only LLM with independent matching gates](0007-proposal-only-llm-with-independent-matching-gates.md) — Accepted.
 - [ADR-0008: Keep minimal durable state without crash-resume](0008-minimal-durable-state-without-crash-resume.md) — Accepted.
 - [ADR-0009: Use a dependency-free Node.js rehearsal slice](0009-rehearsal-slice-implementation-stack.md) — Proposed.
+- [ADR-0010: Add a proposal-only model boundary and dedicated retailer session to the review slice](0010-proposal-model-and-dedicated-session-slice.md) — Proposed.
 
 ## Convention
 

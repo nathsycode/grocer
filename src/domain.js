@@ -77,13 +77,19 @@ function extractQuantity(line) {
   return Number.parseInt(m[1] ?? m[2], 10);
 }
 
+/** The explicitly written quantity, or null when the line states none. */
+export function explicitQuantity(line) {
+  const m = String(line).match(QUANTITY_RE);
+  return m ? Number.parseInt(m[1] ?? m[2], 10) : null;
+}
+
 function sentenceName(text) {
   const cleaned = text.replace(/(\d+(?:\.\d+)?)\s*(kg|g|ml|l)\b/gi, '').trim();
   return cleaned || text;
 }
 
 /** Discover candidates and classify each against the requested item. */
-export function discoverCandidates(item, catalog = CATALOG) {
+export function discoverCandidates(item, catalog = CATALOG, rankings = {}) {
   const itemName = norm(item.name);
   const raw = ` ${norm(item.raw || item.name)} `;
   return catalog
@@ -91,21 +97,27 @@ export function discoverCandidates(item, catalog = CATALOG) {
       if (itemName && norm(prod.name) === itemName) return true;
       return prod.name.split(/\s+/).every((token) => raw.includes(` ${norm(token)} `));
     })
-    .map((prod) => classify(item, prod));
+    .map((prod) => classify(item, prod, rankings[prod.id] ?? null));
 }
 
 /**
  * Classification gate. Colour is not mutation authority and candidate
- * uniqueness never upgrades an unspecified preference to green.
+ * uniqueness never upgrades an unspecified preference to green. A model
+ * ranking is attached for review but is never consulted by the gate, so a
+ * confident proposal cannot make conflicting or missing evidence selectable
+ * (ADR-0007).
  */
-export function classify(item, prod) {
+export function classify(item, prod, modelRanking = null) {
+  const modelRank = Number.isInteger(modelRanking?.rank) ? modelRanking.rank : null;
+  const modelRationale = typeof modelRanking?.rationale === 'string' ? modelRanking.rationale : null;
+  const ranked = (result) => ({ ...result, modelRank, modelRationale });
   if (prod.evidenceConflict) {
-    return {
+    return ranked({
       product: productView(prod),
       color: 'red',
       selectable: false,
       reason: prod.evidenceNote ?? 'Conflicting product evidence; non-selectable.',
-    };
+    });
   }
   const brandSpecified = Boolean(item.brand);
   const sizeSpecified = Boolean(item.size);
@@ -122,54 +134,54 @@ export function classify(item, prod) {
     if (variantSpecified && !variantOk) differences.push(`variant (${prod.variant})`);
     if (sizeSpecified && !sizeOk) differences.push(`size (${prod.size.display})`);
     if (differences.length) {
-      return {
+      return ranked({
         product: productView(prod),
         color: 'red',
         selectable: false,
         reason: `Explicit no-substitution: ${differences.join(', ')} differs from the request; revise the request to select it.`,
-      };
+      });
     }
   }
 
   if (!brandOk) {
-    return {
+    return ranked({
       product: productView(prod),
       color: 'orange',
       selectable: true,
       reason: `Substitution: different brand (${prod.brand}).`,
-    };
+    });
   }
   if (!variantOk) {
-    return {
+    return ranked({
       product: productView(prod),
       color: 'orange',
       selectable: true,
       reason: `Substitution: different variant (${prod.variant}).`,
-    };
+    });
   }
   if (sizeSpecified && !sizeOk) {
-    return {
+    return ranked({
       product: productView(prod),
       color: 'orange',
       selectable: true,
       reason: `Substitution: different size (${prod.size.display}).`,
-    };
+    });
   }
   if (!brandSpecified || !sizeSpecified) {
     const missing = [!brandSpecified ? 'brand' : null, !sizeSpecified ? 'size' : null].filter(Boolean).join(' and ');
-    return {
+    return ranked({
       product: productView(prod),
       color: 'yellow',
       selectable: true,
       reason: `Unspecified ${missing}; choosing ${prod.brand} ${prod.size.display} is a preference choice.`,
-    };
+    });
   }
-  return {
+  return ranked({
     product: productView(prod),
     color: 'green',
     selectable: true,
     reason: 'Exact brand, variant, and size match.',
-  };
+  });
 }
 
 /**
@@ -195,6 +207,8 @@ export function computeAction(item, selection, cart, catalog = CATALOG) {
     priceMinor: prod.priceMinor,
     priceDisplay: formatMoney(prod.priceMinor, prod.currency),
     executable: true,
+    assumptions: item.assumptions ?? [],
+    unresolved: item.unresolved ?? [],
   };
   if (target === existing) return { ...base, kind: 'none', units: 0 };
   if (target > existing) return { ...base, kind: 'add', units: target - existing };
@@ -213,13 +227,14 @@ export function computePlan(items, selections, cart, contextId, revision, catalo
   const unfulfilled = [];
   for (const item of items) {
     const selection = selections[item.id];
+    const review = { assumptions: item.assumptions ?? [], unresolved: item.unresolved ?? [] };
     if (!selection?.productId) {
-      unfulfilled.push({ itemId: item.id, raw: item.raw, reason: 'No choice selected.' });
+      unfulfilled.push({ itemId: item.id, raw: item.raw, reason: 'No choice selected.', ...review });
       continue;
     }
     const action = computeAction(item, selection, cart, catalog);
     if (action.kind === 'unresolved') {
-      unfulfilled.push({ itemId: item.id, raw: item.raw, reason: action.reason });
+      unfulfilled.push({ itemId: item.id, raw: item.raw, reason: action.reason, ...review });
       continue;
     }
     actions.push(action);
