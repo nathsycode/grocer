@@ -1,9 +1,9 @@
 # Landmark signed-in read-only probe — procedure
 
-Status: **prepared, not executed.** No signed-in evidence exists yet. This page
-describes a repeatable, read-only procedure and the evidence it produces. It
-records no live observation; do not read it as verification of the operator's
-account, branch, or cart.
+Status: **attempted, verification still blocked.** The [2026-09-30 attempt](signed-in-read-probe-2026-09-30.md)
+captured product detail but no cart read or correspondence. This page describes
+the repeatable read-only procedure, not its observed outcomes. The operator's
+account, branch mapping, and cart integration remain unverified.
 
 Purpose: complete the ticket 02 investigation gate (see
 `.scratch/grocer-mvp/issues/02-verify-signed-in-context-and-cart-reads.md`,
@@ -29,7 +29,8 @@ Before running:
 - Sign-in and any verification codes happen **in the browser**, never in the
   terminal, chat, prompts, fixtures, or logs.
 - The everyday browser profile is not used. The probe creates its own isolated
-  persistent profile under `.local/` (gitignored).
+  persistent profile under `.local/` (gitignored), with `0700` directory permissions.
+  Evidence directories are also `0700`, and evidence files are `0600`.
 
 ## Setup
 
@@ -67,10 +68,11 @@ the login flow offers.
 
 After step 4 the guard is active: every non-GET/HEAD request to `landmark.ph`
 is aborted, non-rendering cross-origin requests are aborted, checkout/logout
-navigation is blocked, and **redirects are never followed**. Playwright routes
+paths are blocked even for non-navigation reads, and **redirects are never followed**. Playwright routes
 only the first request of a redirect chain, so following one would contact a URL
-the gate never classified; the probe re-issues each same-origin request with
-redirects disabled, refuses the redirect, and records its redacted destination.
+the gate never classified; the probe uses the application's shared route handler
+for every allowed request, including cross-origin rendering assets, with redirects
+disabled. It refuses the redirect and records its redacted destination.
 A blocked redirect is a blocker to read, not a silent failure — open the
 destination URL directly if that read is genuinely needed.
 
@@ -221,7 +223,8 @@ operator explicitly asks to use the browser. Delete
 
 ## Remaining blockers
 
-- The probe has not been run against a signed-in Landmark session.
+- The first signed-in attempt captured no cart read or correspondence.
+- The operator reported accidental cart removals; timing and outcome need clarification before a further live run.
 - No populated cart evidence, branch mapping, or failure-signal evidence exists.
 - Whether the anonymous `substoreAlias=mkt` default relates to the configured
   branch is still unknown and must not be assumed.

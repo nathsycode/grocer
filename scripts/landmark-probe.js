@@ -12,7 +12,7 @@
 //     verification codes never pass through this process
 //   - after sign-in, every non-GET/HEAD request to the retailer origin is
 //     aborted, non-rendering cross-origin requests are aborted, checkout/logout
-//     navigation is blocked, and redirects are never followed
+//     paths are blocked for every request, and redirects are never followed
 //   - only /api/ JSON bodies and query parameters are recorded, and both are
 //     redacted before anything is written; request header and cookie values
 //     are never read or stored (names only)
@@ -31,7 +31,10 @@ import {
   RETAILER_ORIGIN as SHARED_RETAILER_ORIGIN,
   classifyReadRequest,
   classifyReadResponse,
+  applyReadOnlyRoute,
 } from '../src/retailer/read-only-guard.js';
+
+export { applyReadOnlyRoute };
 
 // The read-only request/response gate is shared with the application session so
 // a security fix lands once. The probe keeps its own evidence-recording route
@@ -280,7 +283,7 @@ Options:
 Reads only. See docs/integrations/landmark/signed-in-read-probe-procedure.md.`;
 
 const GUARD_DESCRIPTION =
-  'phase B: non-GET/HEAD to the retailer origin aborted; non-rendering cross-origin requests aborted; checkout/logout navigation blocked; redirects not followed';
+  'phase B: non-GET/HEAD to the retailer origin aborted; non-rendering cross-origin requests aborted; checkout/logout paths blocked for every request; redirects not followed';
 
 async function main(argv) {
   const opts = parseArgs(argv);
@@ -304,7 +307,8 @@ async function main(argv) {
 
   const profileDir = path.resolve(opts.profile);
   const outDir = path.resolve(opts.out);
-  fs.mkdirSync(profileDir, { recursive: true });
+  fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(profileDir, 0o700);
 
   const evidence = {
     probe: {
@@ -418,62 +422,11 @@ async function main(argv) {
         url: redactUrl(req.url()),
         reason,
         ...extra,
+        ...(extra.destination ? { destination: redactUrl(extra.destination) } : {}),
       });
     };
 
-    await context.route('**/*', async (route) => {
-      const req = route.request();
-      const decision = classifyRequest({
-        method: req.method(),
-        url: req.url(),
-        isNavigation: req.isNavigationRequest(),
-        resourceType: req.resourceType(),
-      });
-      if (decision.action === 'abort') {
-        recordBlocked(req, decision.reason);
-        await route.abort('blockedbyclient');
-        return;
-      }
-
-      let origin = null;
-      try {
-        origin = new URL(req.url()).origin;
-      } catch {
-        // classifyRequest already rejected unparseable URLs.
-      }
-      if (origin !== RETAILER_ORIGIN) {
-        // An allowed cross-origin rendering asset cannot reach the retailer
-        // origin, so it is outside the guarded redirect surface.
-        await route.continue();
-        return;
-      }
-
-      // Playwright routes only the first request of a redirect chain, so a
-      // redirect would otherwise be followed without another classification.
-      // Re-issue with redirects disabled and refuse to follow any of them; the
-      // destination is recorded instead.
-      let response;
-      try {
-        response = await route.fetch({ maxRedirects: 0 });
-      } catch (err) {
-        recordBlocked(req, `read-failed:${err.message}`);
-        await route.abort('blockedbyclient');
-        return;
-      }
-      const disposition = classifyResponse({
-        status: response.status(),
-        location: response.headers()['location'],
-        baseUrl: req.url(),
-      });
-      if (disposition.action === 'abort') {
-        recordBlocked(req, disposition.reason, {
-          destination: disposition.destination ? redactUrl(disposition.destination) : null,
-        });
-        await route.abort('blockedbyclient');
-        return;
-      }
-      await route.fulfill({ response });
-    });
+    await context.route('**/*', (route) => applyReadOnlyRoute(route, { recordBlocked }));
 
     const flushObservations = async (ms = 1500) => {
       await page.waitForTimeout(ms);
@@ -595,12 +548,13 @@ async function main(argv) {
   } finally {
     evidence.probe.finishedAt = new Date().toISOString();
     try {
-      fs.mkdirSync(outDir, { recursive: true });
+      fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
+      fs.chmodSync(outDir, 0o700);
       const outFile = path.join(
         outDir,
         `landmark-read-probe-${new Date().toISOString().replace(/[:.]/g, '-')}.json`,
       );
-      fs.writeFileSync(outFile, `${JSON.stringify(evidence, null, 2)}\n`);
+      fs.writeFileSync(outFile, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
       console.log(
         `\nRedacted evidence written to ${outFile}\n` +
           'Share only this file. Review it before sharing; it should contain no names,\n' +

@@ -39,7 +39,7 @@ export function classifyReadRequest({
     return { action: 'abort', reason: 'cross-origin' };
   }
   if (!isRead) return { action: 'abort', reason: `non-read-method:${method}` };
-  if (isNavigation && BLOCKED_NAV.test(parsed.pathname)) {
+  if (BLOCKED_NAV.test(parsed.pathname)) {
     return { action: 'abort', reason: 'blocked-navigation' };
   }
   return { action: 'allow' };

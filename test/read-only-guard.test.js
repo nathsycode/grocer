@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyReadRequest, classifyReadResponse } from '../src/retailer/read-only-guard.js';
-import { classifyRequest, classifyResponse } from '../scripts/landmark-probe.js';
+import { classifyReadRequest, classifyReadResponse, applyReadOnlyRoute } from '../src/retailer/read-only-guard.js';
+import { classifyRequest, classifyResponse, applyReadOnlyRoute as probeRoute } from '../scripts/landmark-probe.js';
 import {
   classifyReadRequest as sessionClassifyRequest,
   classifyReadResponse as sessionClassifyResponse,
+  applyReadOnlyRoute as sessionRoute,
 } from '../src/retailer/session.js';
 
 // The application session and the ticket 02 probe must not drift apart: they
@@ -15,6 +16,8 @@ test('the probe and the session use the same guard implementation', () => {
   assert.equal(classifyResponse, classifyReadResponse);
   assert.equal(sessionClassifyRequest, classifyReadRequest);
   assert.equal(sessionClassifyResponse, classifyReadResponse);
+  assert.equal(probeRoute, applyReadOnlyRoute);
+  assert.equal(sessionRoute, applyReadOnlyRoute);
 });
 
 test('shared guard allows same-origin reads and blocks writes, cross-origin data, and checkout', () => {
@@ -32,6 +35,40 @@ test('shared guard allows same-origin reads and blocks writes, cross-origin data
     classifyReadRequest({ method: 'GET', url: 'https://www.landmark.ph/checkout', isNavigation: true }).action,
     'abort',
   );
+});
+
+test('checkout and logout paths are blocked even for non-navigation reads', () => {
+  for (const method of ['GET', 'HEAD']) {
+    for (const pathname of ['/logout', '/checkout', '/my-account/orders']) {
+      assert.equal(
+        classifyReadRequest({ method, url: `https://www.landmark.ph${pathname}`, isNavigation: false }).action,
+        'abort',
+      );
+    }
+  }
+});
+
+test('probe route refuses cross-origin asset redirects without following them', async () => {
+  const calls = [];
+  const blocked = [];
+  const route = {
+    request: () => ({
+      method: () => 'GET',
+      url: () => 'https://cdn.example/app.js',
+      isNavigationRequest: () => false,
+      resourceType: () => 'script',
+    }),
+    fetch: async (options) => {
+      calls.push(options);
+      return { status: () => 302, headers: () => ({ location: 'https://www.landmark.ph/logout' }) };
+    },
+    abort: async (reason) => calls.push(reason),
+    continue: async () => assert.fail('must not bypass redirect guard'),
+    fulfill: async () => assert.fail('must not fulfill a redirect'),
+  };
+  await probeRoute(route, { recordBlocked: (_req, reason, extra) => blocked.push({ reason, ...extra }) });
+  assert.deepEqual(calls, [{ maxRedirects: 0 }, 'blockedbyclient']);
+  assert.deepEqual(blocked, [{ reason: 'redirect-not-followed', destination: 'https://www.landmark.ph/logout' }]);
 });
 
 test('shared guard never follows a redirect', () => {
