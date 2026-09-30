@@ -11,7 +11,7 @@ import {
   computePlan,
   executableActions,
   revalidateApproval,
-  productIdentityEquals,
+  dispatchBlockReason,
   verifyCart,
   norm,
 } from './domain.js';
@@ -77,6 +77,7 @@ export function reduce(records) {
           status: 'review',
           pauseReason: null,
           verification: null,
+          verificationBinding: null,
           cartObservation: null,
           handoff: null,
           createdAt: r.ts,
@@ -86,7 +87,8 @@ export function reduce(records) {
         currentRunId = r.runId;
         break;
       case 'request_corrected':
-        if (run) {
+        // Handoff is terminal: a correction cannot reopen the run (ADR-0011).
+        if (run && run.status !== 'handed-off') {
           run.revision = r.revision;
           run.items = r.items;
           run.candidates = r.candidates;
@@ -97,7 +99,7 @@ export function reduce(records) {
         }
         break;
       case 'selection_changed':
-        if (run) {
+        if (run && run.status !== 'handed-off') {
           run.selections = r.selections;
           run.approval = null;
           run.plan = null;
@@ -147,6 +149,7 @@ export function reduce(records) {
           to: r.to,
           kind: r.kind,
           priceMinor: r.priceMinor,
+          observedPriceMinor: r.observedPriceMinor ?? r.priceMinor,
           intentAt: r.ts,
           outcome: null,
           resolution: null,
@@ -166,7 +169,16 @@ export function reduce(records) {
         if (run) run.cartObservation = { cart: r.cart, contextId: r.contextId, phase: r.phase, at: r.ts };
         break;
       case 'verification':
-        if (run) run.verification = r.result;
+        if (run) {
+          run.verification = r.result;
+          // Bind the verification to the exact plan, context, and approval it
+          // observed, so a later plan cannot reuse it for handoff (ADR-0011).
+          run.verificationBinding = {
+            revision: r.revision ?? null,
+            contextId: r.contextId ?? null,
+            approvalId: r.approvalId ?? null,
+          };
+        }
         break;
       case 'execution_paused':
         if (run) {
@@ -424,6 +436,15 @@ export class Store {
     return run;
   }
 
+  /** Handoff is terminal: a handed-off run cannot be reopened (ADR-0011). */
+  requireActiveRun(runId) {
+    const run = this.requireRun(runId);
+    if (run.status === 'handed-off') {
+      throw new StoreError('handed-off', 'this run was handed off for manual checkout; start a fresh run for further changes');
+    }
+    return run;
+  }
+
   assertPlanningAllowed() {
     if (this.fatal) throw new StoreError('blocked', this.fatal.reason);
     if (this.retailerFatal) throw new StoreError('blocked', this.blockState().reason);
@@ -524,7 +545,7 @@ export class Store {
 
   correctRequest(runId, items) {
     this.assertPlanningAllowed();
-    const run = this.requireRun(runId);
+    const run = this.requireActiveRun(runId);
     if (!Array.isArray(items) || items.length === 0) throw new StoreError('invalid', 'items are required');
     const normalized = items.map((raw, index) => {
       const previous = run.items.find((i) => i.id === raw?.id) ?? run.items[index] ?? null;
@@ -546,7 +567,7 @@ export class Store {
 
   setSelections(runId, selections) {
     this.assertPlanningAllowed();
-    const run = this.requireRun(runId);
+    const run = this.requireActiveRun(runId);
     for (const [itemId, selection] of Object.entries(selections ?? {})) {
       if (!selection?.productId) continue;
       const candidates = run.candidates[itemId] ?? [];
@@ -562,7 +583,7 @@ export class Store {
 
   reviewPlan(runId) {
     this.assertPlanningAllowed();
-    const run = this.requireRun(runId);
+    const run = this.requireActiveRun(runId);
     // Re-reviewing after an approval means the reviewed inputs are being
     // reconsidered; the old approval must not silently carry over.
     if (run.approval) this.#append('approval_invalidated', { runId, reason: 'plan reviewed again after approval' });
@@ -574,7 +595,7 @@ export class Store {
 
   approvePlan(runId) {
     this.assertPlanningAllowed();
-    const run = this.requireRun(runId);
+    const run = this.requireActiveRun(runId);
     const reviewed = run.plan;
     if (!reviewed || reviewed.revision !== run.revision) {
       throw new StoreError('stale-review', 'review the plan before approving it');
@@ -691,32 +712,39 @@ export class Store {
     const run = this.requireRun(runId);
     const approval = run.approval;
     this.#append('execution_started', { runId });
+    const priceDecreases = [];
 
     for (const action of approval.actions) {
+      // AC4: the current context is checked before every dispatch, not only
+      // once before execution begins. A context change pauses the remainder.
+      if (this.context.contextId !== approval.contextId) {
+        this.pauseQuietly(
+          runId,
+          `shopping context changed since approval (was ${approval.contextId}, now ${this.context.contextId}); reevaluation required`,
+        );
+        return;
+      }
       const cart = this.simulator.cart();
-      const currentFrom = cart[action.productId] ?? 0;
+      // Shared enforceable checks: cart state, product existence, identity,
+      // evidence validity, and price rises (see dispatchBlockReason).
+      const block = dispatchBlockReason(action, { cart, catalog: this.catalog });
+      if (block) {
+        this.pauseQuietly(runId, block);
+        return;
+      }
       const prod = productById(action.productId, this.catalog);
-      if (currentFrom !== action.from) {
-        this.pauseQuietly(
-          runId,
-          `${action.product.name}: cart changed since approval (was ${action.from}, now ${currentFrom}); reevaluation required`,
-        );
-        return;
-      }
-      if (!prod) {
-        this.pauseQuietly(runId, `${action.product.name}: the approved product is no longer in the catalogue; renewed review required`);
-        return;
-      }
-      if (!productIdentityEquals(action.product, prod)) {
-        this.pauseQuietly(runId, `${action.product.name}: product identity changed since approval; renewed review required`);
-        return;
-      }
-      if (prod.priceMinor > action.priceMinor) {
-        this.pauseQuietly(
-          runId,
-          `${action.product.name}: unit price rose to ${formatMoney(prod.priceMinor, prod.currency)}; renewed approval required`,
-        );
-        return;
+      // AC4: a decrease may proceed, but the lower observation is preserved
+      // and surfaced rather than silently dispatched at the stale price.
+      if (prod.priceMinor < action.priceMinor) {
+        priceDecreases.push({
+          itemId: action.itemId,
+          productId: action.productId,
+          name: action.product.name,
+          approvedMinor: action.priceMinor,
+          approvedDisplay: action.priceDisplay,
+          observedMinor: prod.priceMinor,
+          observedDisplay: formatMoney(prod.priceMinor, prod.currency),
+        });
       }
 
       const opId = crypto.randomUUID();
@@ -730,6 +758,7 @@ export class Store {
           from: action.from,
           to: action.to,
           priceMinor: action.priceMinor,
+          observedPriceMinor: prod.priceMinor,
         });
       } catch {
         // Intent must be durable before dispatch (ADR-0008).
@@ -765,8 +794,14 @@ export class Store {
 
     const cart = this.simulator.cart();
     this.#append('cart_observed', { runId, cart, contextId: this.context.contextId, phase: 'post-execution' });
-    const verification = verifyCart(run.plan, cart, this.catalog);
-    this.#append('verification', { runId, result: verification });
+    const verification = verifyCart(run.plan, cart, this.catalog, { priceDecreases });
+    this.#append('verification', {
+      runId,
+      result: verification,
+      revision: run.revision,
+      contextId: this.context.contextId,
+      approvalId: approval.approvalId,
+    });
     this.#append('execution_completed', { runId });
     this.#append('ownership_released', { runId, reason: 'run completed' });
     try {
@@ -794,6 +829,10 @@ export class Store {
    * result exists — an uncertain outcome cannot be hidden behind a handoff.
    */
   handoff(runId) {
+    // Inspect the current durable state rather than cached flags: another
+    // process may have recorded an unresolved mutation or taken ownership
+    // since this store last loaded.
+    this.refresh();
     if (this.fatal) throw new StoreError('blocked', this.fatal.reason);
     if (this.retailerFatal) throw new StoreError('blocked', this.blockState().reason);
     const run = this.requireRun(runId);
@@ -801,7 +840,26 @@ export class Store {
     if (run.status === 'handed-off') throw new StoreError('handed-off', 'this run was already handed off for manual checkout');
     if (this.state.openAttempts.length > 0) throw new StoreError('uncertain', this.blockState().reason);
     if (this.state.ownership.held) throw new StoreError('owned', this.blockState().reason);
+    const holder = this.lock.holder();
+    if (holder && Number.isInteger(holder.pid) && holder.pid !== process.pid && isProcessAlive(holder.pid)) {
+      throw new StoreError('owned', 'another process currently owns cart-changing execution; not handing off');
+    }
     if (!run.verification) throw new StoreError('not-verified', 'the approved plan has not been executed and verified');
+    // The recorded verification must cover this exact plan, context, and
+    // approval: a changed plan cannot reuse an older verification (ADR-0011).
+    const binding = run.verificationBinding;
+    if (
+      !binding ||
+      binding.revision !== run.revision ||
+      binding.contextId !== this.context.contextId ||
+      !run.approval ||
+      binding.approvalId !== run.approval.approvalId
+    ) {
+      throw new StoreError(
+        'not-verified',
+        'the recorded verification does not cover the current plan and context; execute and verify the current plan before handoff',
+      );
+    }
 
     const verification = run.verification;
     const handoff = {
@@ -811,6 +869,7 @@ export class Store {
       discrepancies: verification.discrepancies.length,
       extras: verification.extras.length,
       unfulfilled: verification.unfulfilled.length,
+      priceDecreases: verification.priceDecreases?.length ?? 0,
       note: 'Prepared cart handed to the operator for manual checkout. This is not a recorded purchase.',
     };
     this.#append('checkout_handoff', { runId, handoff });

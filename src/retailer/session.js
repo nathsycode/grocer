@@ -67,6 +67,37 @@ export function createRetailerSession({ dataDir, driver, expectedContext = { acc
   let lastStatus = null;
   let lastCart = null;
 
+  // In-flight operations are tracked so handoff can wait for them to observe
+  // `stopped` and refuse before the browser automation is detached.
+  const pending = new Set();
+  function track(fn) {
+    const promise = (async () => fn())();
+    pending.add(promise);
+    promise.then(
+      () => pending.delete(promise),
+      () => pending.delete(promise),
+    );
+    return promise;
+  }
+  function stoppedStatus() {
+    verified = false;
+    return {
+      verified: false,
+      state: 'handed-off',
+      context: lastContext,
+      problems: ['retailer automation is stopped for manual checkout handoff'],
+    };
+  }
+  function stoppedCart() {
+    return {
+      ok: false,
+      lines: [],
+      context: lastContext,
+      observedAt: new Date().toISOString(),
+      problems: ['retailer automation is stopped for manual checkout handoff'],
+    };
+  }
+
   function prepareProfile() {
     fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
     // mkdir mode is ignored when the directory already exists, so tighten it.
@@ -91,24 +122,21 @@ export function createRetailerSession({ dataDir, driver, expectedContext = { acc
     // session check can never leave a previous `verified` in force.
     verified = false;
     if (stopped) {
-      return {
-        verified: false,
-        state: 'handed-off',
-        context: lastContext,
-        problems: ['retailer automation is stopped for manual checkout handoff'],
-      };
+      return stoppedStatus();
     }
     try {
       await ensureOpen();
     } catch (err) {
       return { verified: false, state: 'unknown', context: null, problems: [err.message] };
     }
+    if (stopped) return stoppedStatus();
     let info;
     try {
       info = await driver.sessionInfo();
     } catch (err) {
       return { verified: false, state: 'unknown', context: null, problems: [`session check failed: ${err.message}`] };
     }
+    if (stopped) return stoppedStatus();
     const context = { account: info?.account ?? null, branch: info?.branch ?? null };
     const problems = [...(info?.problems ?? [])];
     if (!expectedContext.account) problems.push('no intended account is configured; refusing to verify');
@@ -137,6 +165,7 @@ export function createRetailerSession({ dataDir, driver, expectedContext = { acc
       problems.push('wrong branch: the selected branch is not the configured one');
     }
     verified = problems.length === 0;
+    if (stopped) return stoppedStatus();
     lastContext = context;
     lastStatus = { verified, state: verified ? 'verified' : 'signed-in-unverified', context, problems };
     return lastStatus;
@@ -144,16 +173,11 @@ export function createRetailerSession({ dataDir, driver, expectedContext = { acc
 
   async function readCart() {
     if (stopped) {
-      return {
-        ok: false,
-        lines: [],
-        context: lastContext,
-        observedAt: new Date().toISOString(),
-        problems: ['retailer automation is stopped for manual checkout handoff'],
-      };
+      return stoppedCart();
     }
     if (!verified) {
       const status = await verifyContext();
+      if (stopped) return stoppedCart();
       if (!status.verified) {
         return {
           ok: false,
@@ -166,6 +190,9 @@ export function createRetailerSession({ dataDir, driver, expectedContext = { acc
     }
     try {
       const result = await driver.readCart();
+      // Handoff may have happened while the read was in flight: discard the
+      // result and refuse rather than restoring authority after handoff.
+      if (stopped) return stoppedCart();
       const ctx = result?.context ?? null;
       const problems = [...(result?.problems ?? [])];
       if (!ctx || ctx.account !== lastContext?.account || ctx.branch !== lastContext?.branch) {
@@ -199,17 +226,19 @@ export function createRetailerSession({ dataDir, driver, expectedContext = { acc
   return {
     sessionDir,
     profileDir,
-    verifyContext,
-    readCart,
+    verifyContext: () => track(verifyContext),
+    readCart: () => track(readCart),
     /**
      * Stop every automated retailer read, navigation, and mutation for the
      * handoff while leaving the dedicated browser open for the operator's
-     * manual checkout (ADR-0006). Reads are refused immediately; detaching the
-     * browser's automation is best-effort.
+     * manual checkout (ADR-0006). In-flight reads are allowed to observe the
+     * stop and refuse before the browser automation is detached, so nothing
+     * can start or complete a retailer read after handoff returns.
      */
     async handoff() {
       stopped = true;
       verified = false;
+      await Promise.allSettled([...pending]);
       try {
         await driver.handoff?.();
       } catch {

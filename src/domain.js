@@ -269,6 +269,34 @@ export function executableActions(plan) {
 }
 
 /**
+ * The enforceable checks every dispatch of an approved action must pass. Shared
+ * by pre-execution revalidation and per-dispatch execution so the two cannot
+ * drift apart. Returns a reason when dispatch must not proceed, or null when it
+ * may. Candidate identity and evidence validity are re-checked here, never
+ * trusted from the model or the stored approval.
+ */
+export function dispatchBlockReason(action, { cart, catalog = CATALOG } = {}) {
+  const current = cart[action.productId] ?? 0;
+  if (current !== action.from) {
+    return `${action.product.name}: cart changed since approval (was ${action.from}, now ${current}); reevaluation required`;
+  }
+  const prod = productById(action.productId, catalog);
+  if (!prod) {
+    return `${action.product.name}: the approved product is no longer in the catalogue; renewed review required`;
+  }
+  if (!productIdentityEquals(action.product, prod)) {
+    return `${action.product.name}: product identity changed since approval; renewed review required`;
+  }
+  if (prod.evidenceConflict) {
+    return `${action.product.name}: product evidence is now conflicting; renewed review required`;
+  }
+  if (prod.priceMinor > action.priceMinor) {
+    return `${action.product.name}: unit price rose to ${formatMoney(prod.priceMinor, prod.currency)}; renewed approval required`;
+  }
+  return null;
+}
+
+/**
  * Compare a stored approval against current revision, context, cart, price, and
  * product identity. Any mismatch requires reevaluation rather than silent reuse
  * (ADR-0002, ADR-0003).
@@ -279,24 +307,13 @@ export function revalidateApproval(approval, { revision, contextId, cart, catalo
   if (approval.revision !== revision) problems.push('request or selection changed since approval');
   if (approval.contextId !== contextId) problems.push('shopping context changed since approval');
   for (const a of approval.actions) {
-    const current = cart[a.productId] ?? 0;
-    if (current !== a.from) {
-      problems.push(`${a.product.name}: cart showed ${a.from} at approval, now ${current}`);
+    const reason = dispatchBlockReason(a, { cart, catalog });
+    if (reason) {
+      problems.push(reason);
+      continue;
     }
     const prod = productById(a.productId, catalog);
-    if (!prod) {
-      problems.push(`${a.product.name}: the approved product is no longer in the catalogue`);
-      continue;
-    }
-    // Candidate identity is re-checked here, not trusted from the model or the
-    // stored approval: a re-identified product is not the approved product.
-    if (!productIdentityEquals(a.product, prod)) {
-      problems.push(`${a.product.name}: product identity changed since approval; renewed review required`);
-      continue;
-    }
-    if (prod.priceMinor > a.priceMinor) {
-      problems.push(`${a.product.name}: unit price rose from ${a.priceDisplay} to ${formatMoney(prod.priceMinor, prod.currency)}`);
-    } else if (prod.priceMinor < a.priceMinor) {
+    if (prod.priceMinor < a.priceMinor) {
       notes.push(`${a.product.name}: unit price fell to ${formatMoney(prod.priceMinor, prod.currency)}; approved action may proceed.`);
     }
   }
@@ -318,7 +335,7 @@ export function productIdentityEquals(approved, prod) {
   );
 }
 
-export function verifyCart(plan, cart, catalog = CATALOG) {
+export function verifyCart(plan, cart, catalog = CATALOG, { priceDecreases = [] } = {}) {
   const plannedIds = new Set(plan.actions.map((a) => a.productId));
   const fulfilled = [];
   const discrepancies = [];
@@ -372,6 +389,7 @@ export function verifyCart(plan, cart, catalog = CATALOG) {
     discrepancies,
     extras,
     unfulfilled: plan.unfulfilled,
+    priceDecreases,
     observedAt: new Date().toISOString(),
   };
 }

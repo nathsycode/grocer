@@ -364,3 +364,72 @@ test('handoff stops automated reads and leaves the dedicated browser open', asyn
     { driver },
   );
 });
+
+test('handoff cancels a cart read already in flight instead of restoring authority', async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let entered;
+  const enteredP = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const driver = fakeDriver({
+    async readCart() {
+      entered();
+      await gate;
+      return {
+        context: { account: 'intended-account', branch: 'intended-branch' },
+        lines: [{ productId: '39943', quantity: 1, money: { minor: 46900, currency: 'PHP' } }],
+        problems: [],
+      };
+    },
+  });
+  await withSession(
+    async ({ session }) => {
+      await session.verifyContext();
+      const readPromise = session.readCart();
+      await enteredP;
+      const handoffPromise = session.handoff();
+      release();
+      const cart = await readPromise;
+      await handoffPromise;
+      assert.equal(cart.ok, false, 'the in-flight read must not report success after handoff');
+      assert.ok(cart.problems.some((p) => /stopped/i.test(p)));
+      assert.equal(session.status().verified, false);
+    },
+    { driver },
+  );
+});
+
+test('handoff cancels a context verification already in flight', async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let entered;
+  const enteredP = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const driver = fakeDriver({
+    async sessionInfo() {
+      entered();
+      await gate;
+      return { signedIn: true, expired: false, account: 'intended-account', branch: 'intended-branch', problems: [] };
+    },
+  });
+  await withSession(
+    async ({ session }) => {
+      const statusPromise = session.verifyContext();
+      await enteredP;
+      const handoffPromise = session.handoff();
+      release();
+      const status = await statusPromise;
+      await handoffPromise;
+      assert.equal(status.verified, false, 'an in-flight verification must not restore authority');
+      assert.equal(session.status().verified, false);
+      assert.equal((await session.verifyContext()).state, 'handed-off');
+    },
+    { driver },
+  );
+});
