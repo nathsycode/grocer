@@ -389,6 +389,7 @@ export class Store {
         name: p.name,
         variant: p.variant,
         sizeDisplay: p.size.display,
+        priceMinor: p.priceMinor,
         priceDisplay: formatMoney(p.priceMinor, p.currency),
         evidenceConflict: Boolean(p.evidenceConflict),
       })),

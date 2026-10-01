@@ -54,7 +54,7 @@ Playwright is optional and `--no-save`; the rehearsal and tests run without it. 
 | `src/simulator.js` | local simulated retailer cart with idempotency-keyed operations |
 | `src/store.js` | orchestration, run state, one cart-changing execution owner |
 | `src/server.js` | loopback HTTP surface with Host/Origin/CSRF guards |
-| `public/` | hand-written review UI |
+| `public/` | hand-written keyboard-first review UI: `app.js` (rendering, input, backend calls), `model.js` (pure derivations, unit-tested), `styles.css`; system font fallbacks, no third-party requests |
 | `scripts/demo.js` | reproducible sample flow, including approved reduction and safe handoff (ticket 01/04) |
 | `scripts/review-demo.js` | offline evidence-backed review demo (ticket 03) |
 | `scripts/landmark-probe.js` | ticket 02 read-only investigation tooling (not application code) |
@@ -66,6 +66,15 @@ Playwright is optional and `--no-save`; the rehearsal and tests run without it. 
 - Deleting `.local/` is a fresh start. Do **not** delete it to escape a blocked run: an unresolved mutation attempt is intentionally retained and must be resolved through read-only reconciliation. Deleting history is exactly the force-unlock shortcut the design forbids.
 - The backend binds `127.0.0.1` and rejects non-loopback `Host`/`Origin` and missing CSRF tokens on state-changing requests. No browser, shell, or arbitrary network interface is exposed to the model.
 - There is no order or payment path, and no live cart-write entry point in the review slice. Cart actions reach only the local simulator.
+
+## Review UI behaviour worth knowing
+
+- Four steps (List, Review, Add to cart, Handoff) driven from backend state, with a command palette (`⌘K`), jump labels (`s`) and vim-style keys (`?` lists them).
+- `⇧A` reviews the plan, checks it matches what is on screen, approves, then starts execution. A mismatch approves nothing.
+- After a price-increase pause, reapprove/remove reconciles read-only, re-reviews, and only proceeds if the revised plan stays within the prices the operator was shown (ADR-0003).
+- Handoff needs two presses; it is terminal for the run (ADR-0006/0011). The "added" total shown covers the last approval only.
+- Editing an item re-matches it and keeps the operator's other explicit choices where the same product is still selectable.
+- Only the pure `public/model.js` is unit-tested; the DOM layer was exercised manually against the simulator.
 
 ## Validation
 
